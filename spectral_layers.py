@@ -225,10 +225,13 @@ class CausalConv1d(nn.Module):
 
 class SpectralGate(nn.Module):
     """
-    Multi-head spectral gating module.
+    Multi-head spectral gating module with input-dependent filtering.
 
-    Acts as a learnable "graphic equalizer" that amplifies or dampens
-    specific frequency bands via element-wise multiplication.
+    Computes dynamic filter weights based on the input, allowing the model
+    to adaptively amplify or dampen specific frequency bands per-token.
+    
+    This is analogous to how attention computes input-dependent weights,
+    but operates on frequency bands rather than token positions.
     """
 
     def __init__(self, n_heads: int, head_dim: int):
@@ -244,15 +247,19 @@ class SpectralGate(nn.Module):
         self.head_dim = head_dim
         self.d_model = n_heads * head_dim
 
-        # Learnable filter per head: [n_heads, head_dim]
-        self.filter = nn.Parameter(torch.ones(n_heads, head_dim))
-
-        # Initialize filters close to identity (1.0) with small perturbations
-        nn.init.normal_(self.filter, mean=1.0, std=0.1)
+        # Linear projection to compute input-dependent filter weights
+        # Input: [batch, seq, d_model] -> Output: [batch, seq, d_model]
+        self.filter_proj = nn.Linear(self.d_model, self.d_model)
+        
+        # Initialize to produce values near 1.0 (identity-like behavior initially)
+        # Set bias to ~2.0 so sigmoid(2.0) ≈ 0.88, close to the ~0.85 the static 
+        # filters were learning. Weights near zero so initial output is bias-dominated.
+        nn.init.normal_(self.filter_proj.weight, mean=0.0, std=0.01)
+        nn.init.constant_(self.filter_proj.bias, 2.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Apply spectral gating.
+        Apply input-dependent spectral gating.
 
         Args:
             x: Input tensor [batch, seq_len, d_model]
@@ -260,20 +267,17 @@ class SpectralGate(nn.Module):
         Returns:
             Gated tensor [batch, seq_len, d_model]
         """
-        batch, seq_len, d_model = x.shape
-
-        # Reshape to heads: [batch, seq_len, n_heads, head_dim]
-        x = x.view(batch, seq_len, self.n_heads, self.head_dim)
-
-        # Element-wise multiplication with filter (broadcast over batch and seq)
-        x = x * self.filter  # filter broadcasts: [1, 1, n_heads, head_dim]
-
-        # Reshape back: [batch, seq_len, d_model]
-        return x.view(batch, seq_len, d_model)
+        # Compute input-dependent filter weights
+        # sigmoid keeps weights positive and bounded [0, 1]
+        # We scale by 2 to allow weights in range [0, 2] for amplification
+        filter_weights = 2.0 * torch.sigmoid(self.filter_proj(x))
+        
+        # Element-wise multiplication (input-dependent gating)
+        return x * filter_weights
 
     def forward_sliced(self, x: torch.Tensor, cutoff: int) -> torch.Tensor:
         """
-        Apply spectral gating with bandwidth truncation.
+        Apply input-dependent spectral gating with bandwidth truncation.
 
         Args:
             x: Input tensor [batch, seq_len, cutoff]
@@ -282,39 +286,16 @@ class SpectralGate(nn.Module):
         Returns:
             Gated tensor [batch, seq_len, cutoff]
         """
-        batch, seq_len, _ = x.shape
-
-        # Calculate how many complete heads fit in cutoff
-        n_heads_active = cutoff // self.head_dim
-        remainder = cutoff % self.head_dim
-
-        if n_heads_active == 0:
-            # Less than one full head, use partial first head
-            filter_sliced = self.filter[0, :cutoff]
-            return x * filter_sliced
-
-        # Full heads portion
-        if remainder == 0:
-            # Exact head boundary
-            x = x.view(batch, seq_len, n_heads_active, self.head_dim)
-            filter_sliced = self.filter[:n_heads_active]
-            x = x * filter_sliced
-            return x.view(batch, seq_len, cutoff)
-        else:
-            # Partial head at the end
-            full_dim = n_heads_active * self.head_dim
-
-            # Process full heads
-            x_full = x[:, :, :full_dim].view(batch, seq_len, n_heads_active, self.head_dim)
-            filter_full = self.filter[:n_heads_active]
-            x_full = (x_full * filter_full).view(batch, seq_len, full_dim)
-
-            # Process partial head
-            x_partial = x[:, :, full_dim:]
-            filter_partial = self.filter[n_heads_active, :remainder]
-            x_partial = x_partial * filter_partial
-
-            return torch.cat([x_full, x_partial], dim=-1)
+        # Slice the projection weights for elastic inference
+        weight_sliced = self.filter_proj.weight[:cutoff, :cutoff]
+        bias_sliced = self.filter_proj.bias[:cutoff]
+        
+        # Compute input-dependent filter weights with sliced projection
+        filter_logits = F.linear(x, weight_sliced, bias_sliced)
+        filter_weights = 2.0 * torch.sigmoid(filter_logits)
+        
+        # Element-wise multiplication
+        return x * filter_weights
 
 
 class SpectralMLP(nn.Module):

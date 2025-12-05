@@ -30,7 +30,10 @@ from utils import (
 
 def collect_spectral_diagnostics(model: nn.Module) -> dict[str, dict[str, float]]:
     """
-    Collect diagnostic statistics from SpectralGate filters.
+    Collect diagnostic statistics from SpectralGate filter projection.
+    
+    With input-dependent filtering, we log the projection weights/biases
+    rather than static filter values.
     
     Args:
         model: A SpectralGPT model
@@ -51,44 +54,43 @@ def collect_spectral_diagnostics(model: nn.Module) -> dict[str, dict[str, float]
     for layer_idx, layer in enumerate(model.layers):
         layer_name = f"layer_{layer_idx}"
         gate = layer.gate
-        filter_weights = gate.filter  # [n_heads, head_dim]
         
-        # Per-layer aggregate statistics
+        # Get filter projection parameters
+        proj_weight = gate.filter_proj.weight  # [d_model, d_model]
+        proj_bias = gate.filter_proj.bias  # [d_model]
+        
+        # Per-layer aggregate statistics for projection weights
         stats[layer_name] = {
-            # Filter magnitude statistics
-            "filter_l1_norm": filter_weights.abs().mean().item(),
-            "filter_l2_norm": filter_weights.pow(2).mean().sqrt().item(),
-            "filter_min": filter_weights.min().item(),
-            "filter_max": filter_weights.max().item(),
-            "filter_std": filter_weights.std().item(),
+            # Projection weight statistics
+            "proj_weight_l1_norm": proj_weight.abs().mean().item(),
+            "proj_weight_l2_norm": proj_weight.pow(2).mean().sqrt().item(),
+            "proj_weight_std": proj_weight.std().item(),
+            "proj_weight_max": proj_weight.abs().max().item(),
             
-            # Deviation from identity (initialized at 1.0)
-            "filter_mean_deviation_from_1": (filter_weights - 1.0).abs().mean().item(),
+            # Bias statistics (bias controls default filter behavior)
+            "proj_bias_mean": proj_bias.mean().item(),
+            "proj_bias_std": proj_bias.std().item(),
+            "proj_bias_min": proj_bias.min().item(),
+            "proj_bias_max": proj_bias.max().item(),
             
-            # Sparsity: fraction of filters close to zero (< 0.1)
-            "filter_near_zero_frac": (filter_weights.abs() < 0.1).float().mean().item(),
-            
-            # Saturation: fraction of filters with large magnitude (> 2.0)  
-            "filter_saturated_frac": (filter_weights.abs() > 2.0).float().mean().item(),
+            # Effective default filter value: 2 * sigmoid(bias)
+            # This tells us what filter values would be for zero input
+            "default_filter_mean": (2.0 * torch.sigmoid(proj_bias)).mean().item(),
+            "default_filter_std": (2.0 * torch.sigmoid(proj_bias)).std().item(),
         }
-        
-        # Per-head statistics (averaged over head_dim)
-        head_l1_norms = filter_weights.abs().mean(dim=1)  # [n_heads]
-        for head_idx, norm in enumerate(head_l1_norms):
-            stats[layer_name][f"head_{head_idx}_l1_norm"] = norm.item()
     
     return stats
 
 
 def collect_filter_weights(model: nn.Module) -> dict[str, torch.Tensor]:
     """
-    Collect filter weight tensors for histogram logging.
+    Collect filter projection weight tensors for histogram logging.
     
     Args:
         model: A SpectralGPT model
         
     Returns:
-        Dict mapping layer name to filter tensor
+        Dict mapping layer name to projection weight tensor
     """
     weights = {}
     
@@ -99,7 +101,9 @@ def collect_filter_weights(model: nn.Module) -> dict[str, torch.Tensor]:
         return weights
     
     for layer_idx, layer in enumerate(model.layers):
-        weights[f"layer_{layer_idx}"] = layer.gate.filter.detach().cpu()
+        # Log both projection weights and biases
+        weights[f"layer_{layer_idx}_proj_weight"] = layer.gate.filter_proj.weight.detach().cpu()
+        weights[f"layer_{layer_idx}_proj_bias"] = layer.gate.filter_proj.bias.detach().cpu()
     
     return weights
 
