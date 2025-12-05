@@ -14,7 +14,7 @@ class ESMTConfig:
     vocab_size: int = 50257  # GPT-2 tokenizer vocabulary size
     seq_len: int = 512  # Maximum sequence length
     mlp_ratio: int = 4  # MLP expansion ratio (d_model -> mlp_ratio * d_model)
-    conv_kernel_size: int = 3  # Causal convolution kernel size for time-mixing
+    conv_kernel_size: int = 15  # Causal convolution kernel size for time-mixing
     dropout: float = 0.0  # Dropout rate (0 for this experiment)
     eps: float = 1e-6  # Epsilon for SpectralNorm
 
