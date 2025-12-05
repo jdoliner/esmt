@@ -279,7 +279,16 @@ def load_checkpoint(
 ) -> dict:
     """Load model checkpoint."""
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    
+    # Handle state dict from torch.compile() which adds "_orig_mod." prefix
+    state_dict = checkpoint["model_state_dict"]
+    unwrapped_state_dict = {}
+    for key, value in state_dict.items():
+        # Strip "_orig_mod." prefix if present
+        new_key = key.replace("_orig_mod.", "")
+        unwrapped_state_dict[new_key] = value
+    
+    model.load_state_dict(unwrapped_state_dict)
     if optimizer is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     print(f"Loaded checkpoint from step {checkpoint['step']}")
