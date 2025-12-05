@@ -80,18 +80,28 @@ class TinyStoriesDataset(Dataset):
         print(f"Loading TinyStories {split} split...")
         dataset = load_dataset("roneneldan/TinyStories", split=split)
 
-        # Tokenize all texts and concatenate into one long sequence
+        # Tokenize all texts, filtering out those that exceed seq_len
+        # This avoids the "Token indices sequence length is longer than the specified
+        # maximum sequence length" warning from the tokenizer
         print("Tokenizing...")
         all_tokens = []
+        skipped = 0
+        chunk_size = seq_len + 1  # +1 for input/target shift
         for example in dataset:
             tokens = self.tokenizer.encode(
                 example["text"], add_special_tokens=True, truncation=False
             )
+            # Skip examples that are too long (would cause indexing warnings/errors)
+            if len(tokens) > seq_len:
+                skipped += 1
+                continue
             all_tokens.extend(tokens)
+
+        if skipped > 0:
+            print(f"Filtered out {skipped} examples exceeding {seq_len} tokens")
 
         # Chunk into sequences of seq_len + 1 (for input/target shift)
         self.chunks = []
-        chunk_size = seq_len + 1
         for i in range(0, len(all_tokens) - chunk_size + 1, chunk_size):
             chunk = all_tokens[i : i + chunk_size]
             self.chunks.append(torch.tensor(chunk, dtype=torch.long))

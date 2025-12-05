@@ -2,6 +2,7 @@
 
 import argparse
 import random
+import time
 from pathlib import Path
 
 import torch
@@ -113,12 +114,17 @@ def train_model(
     # Training loop
     global_step = 0
     best_val_loss = float("inf")
-
+    
+    # Stats tracking
+    tokens_per_batch = train_config.batch_size * model_config.seq_len
+    
     for epoch in range(train_config.epochs):
         model.train()
         epoch_loss = 0.0
         epoch_loss_full = 0.0
         epoch_loss_trunc = 0.0
+        epoch_tokens = 0
+        epoch_start_time = time.time()
 
         progress_bar = tqdm(
             train_loader,
@@ -128,6 +134,7 @@ def train_model(
 
         for batch_idx, (x, y) in enumerate(progress_bar):
             x, y = x.to(device), y.to(device)
+            batch_start_time = time.time()
 
             # Update learning rate
             lr = get_lr(global_step, train_config, total_steps)
@@ -175,13 +182,30 @@ def train_model(
             epoch_loss_full += loss_full.item()
             if use_matryoshka:
                 epoch_loss_trunc += loss_trunc.item()
+            
+            # Track tokens processed
+            epoch_tokens += tokens_per_batch
+            batch_time = time.time() - batch_start_time
+            tokens_per_sec = tokens_per_batch / batch_time if batch_time > 0 else 0
+            
+            # Calculate running averages and ETA
+            elapsed_time = time.time() - epoch_start_time
+            avg_tokens_per_sec = epoch_tokens / elapsed_time if elapsed_time > 0 else 0
+            batches_remaining = len(train_loader) - (batch_idx + 1)
+            eta_seconds = (batches_remaining * elapsed_time / (batch_idx + 1)) if batch_idx > 0 else 0
+            
+            # Format ETA
+            eta_min, eta_sec = divmod(int(eta_seconds), 60)
+            eta_str = f"{eta_min}m{eta_sec:02d}s" if eta_min > 0 else f"{eta_sec}s"
 
-            # Update progress bar
+            # Update progress bar with high-level stats
             progress_bar.set_postfix(
                 {
                     "loss": f"{loss.item():.4f}",
-                    "loss_full": f"{loss_full.item():.4f}",
+                    "avg_loss": f"{epoch_loss / (batch_idx + 1):.4f}",
+                    "tok/s": f"{avg_tokens_per_sec:.0f}",
                     "lr": f"{lr:.2e}",
+                    "eta": eta_str,
                 }
             )
 
@@ -221,10 +245,15 @@ def train_model(
 
             global_step += 1
 
-        # End of epoch logging
+        # End of epoch logging with high-level stats
+        epoch_time = time.time() - epoch_start_time
         avg_loss = epoch_loss / len(train_loader)
         avg_loss_full = epoch_loss_full / len(train_loader)
-        print(f"Epoch {epoch + 1} - Avg Loss: {avg_loss:.4f}, Avg Full Loss: {avg_loss_full:.4f}")
+        epoch_tokens_per_sec = epoch_tokens / epoch_time if epoch_time > 0 else 0
+        
+        print(f"\nEpoch {epoch + 1} Summary:")
+        print(f"  Avg Loss: {avg_loss:.4f} | Avg Full Loss: {avg_loss_full:.4f}")
+        print(f"  Tokens processed: {epoch_tokens:,} | Time: {epoch_time:.1f}s | Throughput: {epoch_tokens_per_sec:,.0f} tok/s")
 
     # Final evaluation
     print("\nFinal Evaluation:")
