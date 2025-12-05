@@ -213,6 +213,55 @@ class TensorBoardLogger:
         tag = f"speed/tokens_per_sec_bw_{int(bandwidth * 100)}pct"
         self.writer.add_scalar(tag, tokens_per_sec, step)
 
+    def log_spectral_diagnostics(
+        self,
+        filter_stats: dict[str, dict[str, float]],
+        step: int,
+    ) -> None:
+        """
+        Log spectral gate filter diagnostics.
+
+        Args:
+            filter_stats: Nested dict with structure:
+                {layer_name: {metric_name: value}}
+                e.g., {"layer_0": {"filter_l1_norm": 1.5, "filter_l2_norm": 2.3, ...}}
+            step: Current training step
+        """
+        for layer_name, metrics in filter_stats.items():
+            for metric_name, value in metrics.items():
+                tag = f"spectral/{layer_name}/{metric_name}"
+                self.writer.add_scalar(tag, value, step)
+
+    def log_filter_histograms(
+        self,
+        filter_weights: dict[str, torch.Tensor],
+        step: int,
+    ) -> None:
+        """
+        Log histograms of filter weights for visualization.
+
+        Args:
+            filter_weights: Dict mapping layer name to filter tensor
+            step: Current training step
+        """
+        for layer_name, weights in filter_weights.items():
+            self.writer.add_histogram(f"spectral/{layer_name}/filter_weights", weights, step)
+
+    def log_gradient_norms(
+        self,
+        grad_norms: dict[str, float],
+        step: int,
+    ) -> None:
+        """
+        Log gradient norms for different parameter groups.
+
+        Args:
+            grad_norms: Dict mapping parameter group name to gradient norm
+            step: Current training step
+        """
+        for name, norm in grad_norms.items():
+            self.writer.add_scalar(f"gradients/{name}", norm, step)
+
     def flush(self) -> None:
         """Flush pending writes."""
         self.writer.flush()

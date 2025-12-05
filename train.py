@@ -28,6 +28,142 @@ from utils import (
 )
 
 
+def collect_spectral_diagnostics(model: nn.Module) -> dict[str, dict[str, float]]:
+    """
+    Collect diagnostic statistics from SpectralGate filters.
+    
+    Args:
+        model: A SpectralGPT model
+        
+    Returns:
+        Dict with structure: {layer_name: {metric_name: value}}
+    """
+    stats = {}
+    
+    # Check if this is a compiled model and unwrap if needed
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+    
+    # Only collect for SpectralGPT models
+    if not hasattr(model, "layers"):
+        return stats
+    
+    for layer_idx, layer in enumerate(model.layers):
+        layer_name = f"layer_{layer_idx}"
+        gate = layer.gate
+        filter_weights = gate.filter  # [n_heads, head_dim]
+        
+        # Per-layer aggregate statistics
+        stats[layer_name] = {
+            # Filter magnitude statistics
+            "filter_l1_norm": filter_weights.abs().mean().item(),
+            "filter_l2_norm": filter_weights.pow(2).mean().sqrt().item(),
+            "filter_min": filter_weights.min().item(),
+            "filter_max": filter_weights.max().item(),
+            "filter_std": filter_weights.std().item(),
+            
+            # Deviation from identity (initialized at 1.0)
+            "filter_mean_deviation_from_1": (filter_weights - 1.0).abs().mean().item(),
+            
+            # Sparsity: fraction of filters close to zero (< 0.1)
+            "filter_near_zero_frac": (filter_weights.abs() < 0.1).float().mean().item(),
+            
+            # Saturation: fraction of filters with large magnitude (> 2.0)  
+            "filter_saturated_frac": (filter_weights.abs() > 2.0).float().mean().item(),
+        }
+        
+        # Per-head statistics (averaged over head_dim)
+        head_l1_norms = filter_weights.abs().mean(dim=1)  # [n_heads]
+        for head_idx, norm in enumerate(head_l1_norms):
+            stats[layer_name][f"head_{head_idx}_l1_norm"] = norm.item()
+    
+    return stats
+
+
+def collect_filter_weights(model: nn.Module) -> dict[str, torch.Tensor]:
+    """
+    Collect filter weight tensors for histogram logging.
+    
+    Args:
+        model: A SpectralGPT model
+        
+    Returns:
+        Dict mapping layer name to filter tensor
+    """
+    weights = {}
+    
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+        
+    if not hasattr(model, "layers"):
+        return weights
+    
+    for layer_idx, layer in enumerate(model.layers):
+        weights[f"layer_{layer_idx}"] = layer.gate.filter.detach().cpu()
+    
+    return weights
+
+
+def collect_gradient_norms(model: nn.Module) -> dict[str, float]:
+    """
+    Collect gradient norms for different parameter groups.
+    
+    Args:
+        model: The model (SpectralGPT or NanoGPT)
+        
+    Returns:
+        Dict mapping parameter group name to gradient norm
+    """
+    norms = {}
+    
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+    
+    # Collect by parameter type
+    filter_grads = []
+    conv_grads = []
+    mlp_grads = []
+    embedding_grads = []
+    other_grads = []
+    
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        grad_norm = param.grad.norm().item()
+        
+        if "filter" in name:
+            filter_grads.append(grad_norm)
+        elif "conv" in name:
+            conv_grads.append(grad_norm)
+        elif "mlp" in name or "fc1" in name or "fc2" in name:
+            mlp_grads.append(grad_norm)
+        elif "emb" in name:
+            embedding_grads.append(grad_norm)
+        else:
+            other_grads.append(grad_norm)
+    
+    # Aggregate norms
+    if filter_grads:
+        norms["filter_grad_norm"] = sum(filter_grads) / len(filter_grads)
+    if conv_grads:
+        norms["conv_grad_norm"] = sum(conv_grads) / len(conv_grads)
+    if mlp_grads:
+        norms["mlp_grad_norm"] = sum(mlp_grads) / len(mlp_grads)
+    if embedding_grads:
+        norms["embedding_grad_norm"] = sum(embedding_grads) / len(embedding_grads)
+    if other_grads:
+        norms["other_grad_norm"] = sum(other_grads) / len(other_grads)
+    
+    # Total gradient norm
+    total_norm = 0.0
+    for param in model.parameters():
+        if param.grad is not None:
+            total_norm += param.grad.norm().item() ** 2
+    norms["total_grad_norm"] = total_norm ** 0.5
+    
+    return norms
+
+
 def get_lr(step: int, config: TrainConfig, total_steps: int) -> float:
     """
     Compute learning rate with linear warmup and cosine decay.
@@ -222,6 +358,22 @@ def train_model(
                     logger.log_scalar("train/loss_trunc", loss_trunc.item(), global_step)
                     logger.log_scalar("train/bandwidth", bandwidth, global_step)
                 logger.log_scalar("train/lr", lr, global_step)
+                
+                # Log gradient norms
+                grad_norms = collect_gradient_norms(model)
+                logger.log_gradient_norms(grad_norms, global_step)
+            
+            # Log spectral diagnostics less frequently (every 100 steps)
+            if global_step % 100 == 0 and use_matryoshka:
+                spectral_stats = collect_spectral_diagnostics(model)
+                if spectral_stats:
+                    logger.log_spectral_diagnostics(spectral_stats, global_step)
+                    
+                # Log filter weight histograms even less frequently (every 500 steps)
+                if global_step % 500 == 0:
+                    filter_weights = collect_filter_weights(model)
+                    if filter_weights:
+                        logger.log_filter_histograms(filter_weights, global_step)
 
             # Evaluation at intervals
             if (global_step + 1) % train_config.eval_interval == 0:
@@ -376,6 +528,12 @@ def main():
         default=42,
         help="Random seed",
     )
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default=None,
+        help="Run name for TensorBoard logging (default: model name)",
+    )
 
     args = parser.parse_args()
 
@@ -407,11 +565,12 @@ def main():
         print("\n" + "=" * 60)
         print("Training ESMT (with Matryoshka loss)")
         print("=" * 60)
+        esmt_run_name = f"{args.run_name}_esmt" if args.run_name else "esmt"
         esmt = train_model(
             esmt,
             train_config,
             esmt_config,
-            model_name="esmt",
+            model_name=esmt_run_name,
             use_matryoshka=True,
         )
 
@@ -419,11 +578,12 @@ def main():
         print("\n" + "=" * 60)
         print("Training NanoGPT (standard training, no Matryoshka)")
         print("=" * 60)
+        nanogpt_run_name = f"{args.run_name}_nanogpt" if args.run_name else "nanogpt"
         nanogpt = train_model(
             nanogpt,
             train_config,
             nano_config,
-            model_name="nanogpt",
+            model_name=nanogpt_run_name,
             use_matryoshka=False,
         )
 
