@@ -1,6 +1,11 @@
 """Utility functions for ESMT training and evaluation."""
 
 import os
+
+# Suppress tokenizers parallelism warning when using multiprocessing DataLoaders
+# Must be set before importing transformers/tokenizers
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import random
 import time
 from pathlib import Path
@@ -75,23 +80,45 @@ class TinyStoriesDataset(Dataset):
             self.tokenizer.pad_token = self.tokenizer.eos_token
         else:
             self.tokenizer = tokenizer
+        
+        # Suppress the "Token indices sequence length is longer than the specified
+        # maximum sequence length" warning by setting model_max_length high
+        self.tokenizer.model_max_length = 100000
 
         # Load and tokenize dataset
         print(f"Loading TinyStories {split} split...")
         dataset = load_dataset("roneneldan/TinyStories", split=split)
 
-        # Tokenize all texts, filtering out those that exceed seq_len
-        # This avoids the "Token indices sequence length is longer than the specified
-        # maximum sequence length" warning from the tokenizer
-        print("Tokenizing...")
+        # Tokenize all texts using multiprocessing
+        print(f"Tokenizing {len(dataset)} examples with multiprocessing...")
+        
+        def tokenize_fn(examples):
+            """Batch tokenization function for dataset.map()"""
+            tokenized = self.tokenizer(
+                examples["text"],
+                add_special_tokens=True,
+                truncation=False,
+                return_attention_mask=False,
+            )
+            return {"input_ids": tokenized["input_ids"]}
+        
+        # Use all available CPU cores for tokenization
+        num_proc = os.cpu_count() or 4
+        tokenized_dataset = dataset.map(
+            tokenize_fn,
+            batched=True,
+            batch_size=1000,
+            num_proc=num_proc,
+            remove_columns=dataset.column_names,
+            desc="Tokenizing",
+        )
+        
+        # Filter and concatenate tokens
         all_tokens = []
         skipped = 0
-        chunk_size = seq_len + 1  # +1 for input/target shift
-        for example in dataset:
-            tokens = self.tokenizer.encode(
-                example["text"], add_special_tokens=True, truncation=False
-            )
-            # Skip examples that are too long (would cause indexing warnings/errors)
+        for example in tokenized_dataset:
+            tokens = example["input_ids"]
+            # Skip examples that are too long
             if len(tokens) > seq_len:
                 skipped += 1
                 continue
@@ -102,6 +129,7 @@ class TinyStoriesDataset(Dataset):
 
         # Chunk into sequences of seq_len + 1 (for input/target shift)
         self.chunks = []
+        chunk_size = seq_len + 1
         for i in range(0, len(all_tokens) - chunk_size + 1, chunk_size):
             chunk = all_tokens[i : i + chunk_size]
             self.chunks.append(torch.tensor(chunk, dtype=torch.long))

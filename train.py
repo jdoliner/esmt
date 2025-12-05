@@ -1,5 +1,10 @@
 """Training script for ESMT and NanoGPT baseline."""
 
+import os
+
+# Suppress tokenizers parallelism warning when using multiprocessing DataLoaders
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import argparse
 import random
 import time
