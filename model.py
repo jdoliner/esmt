@@ -105,6 +105,21 @@ class SpectralGPT(nn.Module):
 
         return logits
 
+    def get_spectral_regularization_loss(self) -> torch.Tensor:
+        """
+        Collect spectral regularization loss from all layers.
+
+        This loss encourages the spectral attention to maintain its
+        frequency-aware properties rather than degenerating to standard attention.
+
+        Returns:
+            Scalar regularization loss (sum over all layers)
+        """
+        total_loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        for layer in self.layers:
+            total_loss = total_loss + layer.get_regularization_loss()
+        return total_loss
+
 
 # ==============================================================================
 # NanoGPT Baseline Implementation

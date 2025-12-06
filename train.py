@@ -291,6 +291,11 @@ def train_model(
                     logits_full.view(-1, logits_full.size(-1)), y.view(-1)
                 )
 
+                # Initialize variables that may not be set in all branches
+                bandwidth = 1.0
+                loss_trunc = torch.tensor(0.0, device=x.device)
+                reg_loss = torch.tensor(0.0, device=x.device)
+
                 if use_matryoshka:
                     # Sample random bandwidth for truncated pass
                     bandwidth = random.uniform(
@@ -301,11 +306,16 @@ def train_model(
                         logits_trunc.view(-1, logits_trunc.size(-1)), y.view(-1)
                     )
 
-                    # Combined loss
-                    loss = loss_full + train_config.lambda_trunc * loss_trunc
+                    # Get spectral regularization loss (prevents degeneration to standard attention)
+                    # Access the underlying model if compiled
+                    base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+                    if hasattr(base_model, "get_spectral_regularization_loss"):
+                        reg_loss = base_model.get_spectral_regularization_loss()
+
+                    # Combined loss: LM loss + truncated loss + regularization
+                    loss = loss_full + train_config.lambda_trunc * loss_trunc + reg_loss
                 else:
                     loss = loss_full
-                    loss_trunc = torch.tensor(0.0)
 
             # Backward pass with gradient scaling
             scaler.scale(loss).backward()
@@ -357,6 +367,7 @@ def train_model(
                 if use_matryoshka:
                     logger.log_scalar("train/loss_trunc", loss_trunc.item(), global_step)
                     logger.log_scalar("train/bandwidth", bandwidth, global_step)
+                    logger.log_scalar("train/reg_loss", reg_loss.item(), global_step)
                 logger.log_scalar("train/lr", lr, global_step)
                 
                 # Log gradient norms

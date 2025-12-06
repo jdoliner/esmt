@@ -14,13 +14,14 @@ class ESMTConfig:
     vocab_size: int = 50257  # GPT-2 tokenizer vocabulary size
     seq_len: int = 512  # Maximum sequence length
     mlp_ratio: int = 4  # MLP expansion ratio (d_model -> mlp_ratio * d_model)
-    conv_kernel_size: int = 3  # Causal convolution kernel size for time-mixing
+    pool_width: int = 3  # Frequency pooling width for spectral attention (must be odd)
     dropout: float = 0.0  # Dropout rate (0 for this experiment)
     eps: float = 1e-6  # Epsilon for SpectralNorm
 
     def __post_init__(self):
         assert self.d_model % 2 == 0, "d_model must be even"
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
+        assert self.pool_width % 2 == 1, "pool_width must be odd for symmetric pooling"
 
     @property
     def head_dim(self) -> int:
