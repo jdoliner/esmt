@@ -30,10 +30,12 @@ from utils import (
 
 def collect_spectral_diagnostics(model: nn.Module) -> dict[str, dict[str, float]]:
     """
-    Collect diagnostic statistics from SpectralGate filter projection.
+    Collect diagnostic statistics from DualSpectralAttention.
     
-    With input-dependent filtering, we log the projection weights/biases
-    rather than static filter values.
+    Logs metrics for:
+    - Cross-frequency mixing matrix (W_cross)
+    - Frequency shift weights
+    - Gate values (balance between cross-freq and conv paths)
     
     Args:
         model: A SpectralGPT model
@@ -53,44 +55,62 @@ def collect_spectral_diagnostics(model: nn.Module) -> dict[str, dict[str, float]
     
     for layer_idx, layer in enumerate(model.layers):
         layer_name = f"layer_{layer_idx}"
-        gate = layer.gate
+        attn = layer.attn
         
-        # Get filter projection parameters
-        proj_weight = gate.filter_proj.weight  # [d_model, d_model]
-        proj_bias = gate.filter_proj.bias  # [d_model]
+        # Cross-frequency mixing matrix statistics
+        W_cross = attn.W_cross  # [n_heads, head_dim, head_dim]
         
-        # Per-layer aggregate statistics for projection weights
+        # Compute how far W_cross has deviated from identity
+        identity = torch.eye(W_cross.shape[1], device=W_cross.device)
+        deviation_from_identity = (W_cross - identity.unsqueeze(0)).abs().mean().item()
+        
+        # Diagonal vs off-diagonal magnitude (are we learning cross-freq relationships?)
+        diag_mask = identity.bool().unsqueeze(0).expand_as(W_cross)
+        diag_magnitude = W_cross[diag_mask].abs().mean().item()
+        offdiag_magnitude = W_cross[~diag_mask].abs().mean().item()
+        
+        # Shift weights statistics
+        shift_weights = attn.shift_weights  # [n_heads, max_shift]
+        
+        # Gate values (cross-freq vs conv balance)
+        gate_values = torch.sigmoid(attn.gate)  # [n_heads]
+        
         stats[layer_name] = {
-            # Projection weight statistics
-            "proj_weight_l1_norm": proj_weight.abs().mean().item(),
-            "proj_weight_l2_norm": proj_weight.pow(2).mean().sqrt().item(),
-            "proj_weight_std": proj_weight.std().item(),
-            "proj_weight_max": proj_weight.abs().max().item(),
+            # Cross-frequency matrix stats
+            "w_cross_deviation_from_identity": deviation_from_identity,
+            "w_cross_diag_magnitude": diag_magnitude,
+            "w_cross_offdiag_magnitude": offdiag_magnitude,
+            "w_cross_offdiag_ratio": offdiag_magnitude / (diag_magnitude + 1e-8),
             
-            # Bias statistics (bias controls default filter behavior)
-            "proj_bias_mean": proj_bias.mean().item(),
-            "proj_bias_std": proj_bias.std().item(),
-            "proj_bias_min": proj_bias.min().item(),
-            "proj_bias_max": proj_bias.max().item(),
+            # Shift weights stats
+            "shift_weights_mean": shift_weights.mean().item(),
+            "shift_weights_std": shift_weights.std().item(),
+            "shift_weights_max": shift_weights.max().item(),
+            "shift_weight_0": shift_weights[:, 0].mean().item(),  # zero-shift importance
             
-            # Effective default filter value: 2 * sigmoid(bias)
-            # This tells us what filter values would be for zero input
-            "default_filter_mean": (2.0 * torch.sigmoid(proj_bias)).mean().item(),
-            "default_filter_std": (2.0 * torch.sigmoid(proj_bias)).std().item(),
+            # Gate stats (1.0 = all cross-freq, 0.0 = all conv)
+            "gate_mean": gate_values.mean().item(),
+            "gate_std": gate_values.std().item(),
+            "gate_min": gate_values.min().item(),
+            "gate_max": gate_values.max().item(),
         }
+        
+        # Per-head gate values
+        for head_idx, gate_val in enumerate(gate_values):
+            stats[layer_name][f"head_{head_idx}_gate"] = gate_val.item()
     
     return stats
 
 
 def collect_filter_weights(model: nn.Module) -> dict[str, torch.Tensor]:
     """
-    Collect filter projection weight tensors for histogram logging.
+    Collect attention weight tensors for histogram logging.
     
     Args:
         model: A SpectralGPT model
         
     Returns:
-        Dict mapping layer name to projection weight tensor
+        Dict mapping layer name to weight tensors
     """
     weights = {}
     
@@ -101,9 +121,11 @@ def collect_filter_weights(model: nn.Module) -> dict[str, torch.Tensor]:
         return weights
     
     for layer_idx, layer in enumerate(model.layers):
-        # Log both projection weights and biases
-        weights[f"layer_{layer_idx}_proj_weight"] = layer.gate.filter_proj.weight.detach().cpu()
-        weights[f"layer_{layer_idx}_proj_bias"] = layer.gate.filter_proj.bias.detach().cpu()
+        attn = layer.attn
+        # Log cross-frequency matrix and shift weights
+        weights[f"layer_{layer_idx}_W_cross"] = attn.W_cross.detach().cpu()
+        weights[f"layer_{layer_idx}_shift_weights"] = attn.shift_weights.detach().cpu()
+        weights[f"layer_{layer_idx}_gate"] = torch.sigmoid(attn.gate).detach().cpu()
     
     return weights
 

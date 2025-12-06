@@ -298,6 +298,268 @@ class SpectralGate(nn.Module):
         return x * filter_weights
 
 
+class DualSpectralAttention(nn.Module):
+    """
+    Dual-path spectral attention combining cross-frequency and frequency-shift similarity.
+    
+    Path 1 (Cross-frequency): Learns which query frequencies should attend to which 
+    key frequencies via a learned mixing matrix. Captures structured f->g relationships.
+    
+    Path 2 (Spectral convolution): Computes frequency-shift similarity by correlating
+    spectra at different shifts. Captures patterns where related tokens have similar
+    spectral shapes but shifted in frequency (e.g., morphological variants).
+    
+    Both paths operate directly on frequency-domain representations (no FFT needed
+    since embeddings are already spectral coefficients).
+    """
+    
+    def __init__(self, d_model: int, n_heads: int, max_shift: int | None = None):
+        """
+        Initialize DualSpectralAttention.
+        
+        Args:
+            d_model: Model dimension (number of frequency bands)
+            n_heads: Number of attention heads
+            max_shift: Maximum frequency shift to consider (default: head_dim // 2)
+        """
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.max_shift = max_shift if max_shift is not None else max(1, self.head_dim // 2)
+        
+        # Q, K, V projections (shared between both paths)
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+        
+        # Path 1: Cross-frequency mixing matrix per head
+        # W_cross[h, f, g] = importance of query_freq_f attending to key_freq_g
+        self.W_cross = nn.Parameter(torch.zeros(n_heads, self.head_dim, self.head_dim))
+        # Initialize as identity (same-frequency attention) with small noise
+        for h in range(n_heads):
+            nn.init.eye_(self.W_cross.data[h])
+        self.W_cross.data += torch.randn_like(self.W_cross) * 0.01
+        
+        # Path 2: Learned weights for each frequency shift
+        # shift_weights[h, tau] = importance of shift tau for head h
+        self.shift_weights = nn.Parameter(torch.zeros(n_heads, self.max_shift))
+        # Initialize with exponential decay (small shifts more important)
+        for h in range(n_heads):
+            self.shift_weights.data[h] = torch.exp(
+                -torch.arange(self.max_shift).float() / (self.max_shift / 4)
+            )
+        
+        # Learned gate to combine paths (one per head for flexibility)
+        # Initialized to 0.5 (equal weighting)
+        self.gate = nn.Parameter(torch.zeros(n_heads))
+        
+        # Scale factor for attention scores
+        self.scale = self.head_dim ** -0.5
+        
+    def _cross_frequency_scores(self, Q: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
+        """
+        Compute cross-frequency attention scores.
+        
+        Q: [batch, seq_q, heads, head_dim]
+        K: [batch, seq_k, heads, head_dim]
+        
+        Returns: [batch, heads, seq_q, seq_k]
+        """
+        # Q @ W_cross: [batch, seq_q, heads, head_dim]
+        Q_transformed = torch.einsum('bqhf,hfg->bqhg', Q, self.W_cross)
+        
+        # (Q @ W_cross) @ K^T: [batch, heads, seq_q, seq_k]
+        scores = torch.einsum('bqhd,bkhd->bhqk', Q_transformed, K)
+        
+        return scores
+    
+    def _spectral_conv_scores(self, Q: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
+        """
+        Compute frequency-shift similarity scores.
+        
+        For each (query, key) pair, computes correlation at multiple frequency shifts
+        and returns weighted sum based on learned shift importance.
+        
+        Q: [batch, seq_q, heads, head_dim]
+        K: [batch, seq_k, heads, head_dim]
+        
+        Returns: [batch, heads, seq_q, seq_k]
+        """
+        batch, seq_q, heads, freq = Q.shape
+        seq_k = K.shape[1]
+        
+        # Rearrange for easier manipulation
+        Q = Q.permute(0, 2, 1, 3)  # [batch, heads, seq_q, freq]
+        K = K.permute(0, 2, 1, 3)  # [batch, heads, seq_k, freq]
+        
+        # Build shifted versions of K and compute dot products
+        # K_shifted[tau] has K's frequencies shifted left by tau
+        # (i.e., K_shifted[..., f] = K[..., f + tau])
+        
+        dots = []
+        for tau in range(self.max_shift):
+            if tau == 0:
+                # No shift: standard dot product
+                dot = torch.einsum('bhqf,bhkf->bhqk', Q, K)
+            else:
+                # Shift: Q[0:freq-tau] dot K[tau:freq]
+                overlap = freq - tau
+                Q_slice = Q[..., :overlap]
+                K_slice = K[..., tau:tau + overlap]
+                dot = torch.einsum('bhqf,bhkf->bhqk', Q_slice, K_slice)
+            dots.append(dot)
+        
+        # Stack shifts: [batch, heads, seq_q, seq_k, max_shift]
+        dots = torch.stack(dots, dim=-1)
+        
+        # Weight by learned shift importance and sum
+        scores = torch.einsum('bhqks,hs->bhqk', dots, self.shift_weights)
+        
+        return scores
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass with dual-path spectral attention.
+        
+        Args:
+            x: Input tensor [batch, seq_len, d_model]
+            
+        Returns:
+            Output tensor [batch, seq_len, d_model]
+        """
+        batch, seq_len, _ = x.shape
+        
+        # Project to Q, K, V
+        Q = self.W_q(x).view(batch, seq_len, self.n_heads, self.head_dim)
+        K = self.W_k(x).view(batch, seq_len, self.n_heads, self.head_dim)
+        V = self.W_v(x).view(batch, seq_len, self.n_heads, self.head_dim)
+        
+        # Compute scores from both paths
+        scores_cross = self._cross_frequency_scores(Q, K)  # [batch, heads, seq_q, seq_k]
+        scores_conv = self._spectral_conv_scores(Q, K)     # [batch, heads, seq_q, seq_k]
+        
+        # Combine paths with learned gating (per head)
+        gate = torch.sigmoid(self.gate)  # [heads]
+        gate = gate.view(1, self.n_heads, 1, 1)
+        scores = gate * scores_cross + (1 - gate) * scores_conv
+        
+        # Scale
+        scores = scores * self.scale
+        
+        # Causal mask
+        mask = torch.triu(
+            torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device),
+            diagonal=1
+        )
+        scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+        
+        # Softmax over keys
+        attn = torch.softmax(scores, dim=-1)
+        
+        # Aggregate values
+        # attn: [batch, heads, seq_q, seq_k]
+        # V: [batch, seq_k, heads, head_dim]
+        V_permuted = V.permute(0, 2, 1, 3)  # [batch, heads, seq_k, head_dim]
+        out = torch.einsum('bhqk,bhkd->bhqd', attn, V_permuted)
+        
+        # Reshape and output projection
+        out = out.permute(0, 2, 1, 3).reshape(batch, seq_len, self.d_model)
+        return self.W_o(out)
+    
+    def forward_sliced(self, x: torch.Tensor, cutoff: int) -> torch.Tensor:
+        """
+        Forward pass with bandwidth truncation for elastic inference.
+        
+        Args:
+            x: Input tensor [batch, seq_len, cutoff]
+            cutoff: Number of active frequency dimensions
+            
+        Returns:
+            Output tensor [batch, seq_len, cutoff]
+        """
+        batch, seq_len, _ = x.shape
+        
+        # Calculate active heads and head_dim for this cutoff
+        n_heads_active = cutoff // self.head_dim
+        if n_heads_active == 0:
+            n_heads_active = 1
+            head_dim_active = cutoff
+        else:
+            head_dim_active = self.head_dim
+        
+        active_dim = n_heads_active * head_dim_active
+        
+        # Slice projection weights
+        Q = F.linear(x, self.W_q.weight[:active_dim, :cutoff], 
+                     self.W_q.bias[:active_dim] if self.W_q.bias is not None else None)
+        K = F.linear(x, self.W_k.weight[:active_dim, :cutoff],
+                     self.W_k.bias[:active_dim] if self.W_k.bias is not None else None)
+        V = F.linear(x, self.W_v.weight[:active_dim, :cutoff],
+                     self.W_v.bias[:active_dim] if self.W_v.bias is not None else None)
+        
+        Q = Q.view(batch, seq_len, n_heads_active, head_dim_active)
+        K = K.view(batch, seq_len, n_heads_active, head_dim_active)
+        V = V.view(batch, seq_len, n_heads_active, head_dim_active)
+        
+        # Cross-frequency scores with sliced W_cross
+        W_cross_sliced = self.W_cross[:n_heads_active, :head_dim_active, :head_dim_active]
+        Q_transformed = torch.einsum('bqhf,hfg->bqhg', Q, W_cross_sliced)
+        scores_cross = torch.einsum('bqhd,bkhd->bhqk', Q_transformed, K)
+        
+        # Spectral conv scores with sliced operations
+        max_shift_active = min(self.max_shift, head_dim_active)
+        Q_perm = Q.permute(0, 2, 1, 3)
+        K_perm = K.permute(0, 2, 1, 3)
+        
+        dots = []
+        for tau in range(max_shift_active):
+            if tau == 0:
+                dot = torch.einsum('bhqf,bhkf->bhqk', Q_perm, K_perm)
+            else:
+                overlap = head_dim_active - tau
+                dot = torch.einsum('bhqf,bhkf->bhqk', 
+                                   Q_perm[..., :overlap], K_perm[..., tau:tau + overlap])
+            dots.append(dot)
+        
+        dots = torch.stack(dots, dim=-1)
+        shift_weights_sliced = self.shift_weights[:n_heads_active, :max_shift_active]
+        scores_conv = torch.einsum('bhqks,hs->bhqk', dots, shift_weights_sliced)
+        
+        # Combine paths
+        gate = torch.sigmoid(self.gate[:n_heads_active]).view(1, n_heads_active, 1, 1)
+        scores = gate * scores_cross + (1 - gate) * scores_conv
+        
+        # Scale
+        scale = head_dim_active ** -0.5
+        scores = scores * scale
+        
+        # Causal mask
+        mask = torch.triu(
+            torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device),
+            diagonal=1
+        )
+        scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+        
+        # Softmax and aggregate
+        attn = torch.softmax(scores, dim=-1)
+        V_perm = V.permute(0, 2, 1, 3)
+        out = torch.einsum('bhqk,bhkd->bhqd', attn, V_perm)
+        
+        # Output projection with sliced weights
+        out = out.permute(0, 2, 1, 3).reshape(batch, seq_len, active_dim)
+        
+        # Handle case where active_dim < cutoff (pad with zeros or project appropriately)
+        if active_dim < cutoff:
+            out = F.pad(out, (0, cutoff - active_dim))
+        
+        out = F.linear(out, self.W_o.weight[:cutoff, :cutoff],
+                       self.W_o.bias[:cutoff] if self.W_o.bias is not None else None)
+        
+        return out
+
+
 class SpectralMLP(nn.Module):
     """
     Feed-forward network (mixer) for cross-band frequency mixing.
@@ -370,12 +632,13 @@ class SpectralGatedLayer(nn.Module):
     """
     Single Spectral Gated Layer (SGL) block.
 
-    Replaces the standard Self-Attention + MLP block with:
-    1. CausalConv1d (time-mixing)
-    2. SpectralGate (frequency filtering)
-    3. SpectralMLP (cross-band mixing)
-    4. SpectralNorm
-    5. Residual connection
+    Architecture:
+    1. DualSpectralAttention (sequence mixing via spectral attention)
+    2. SpectralMLP (cross-band frequency mixing)
+    3. SpectralNorm + Residual connections
+    
+    The DualSpectralAttention replaces the previous CausalConv1d + SpectralGate,
+    providing both sequence mixing and frequency-aware attention in a single operation.
     """
 
     def __init__(self, config: ESMTConfig):
@@ -388,11 +651,8 @@ class SpectralGatedLayer(nn.Module):
         super().__init__()
         self.config = config
 
-        # Time-mixing via causal convolution
-        self.conv = CausalConv1d(config.d_model, config.conv_kernel_size)
-
-        # Spectral gating (multi-head)
-        self.gate = SpectralGate(config.n_heads, config.head_dim)
+        # Dual-path spectral attention (handles sequence mixing with spectral awareness)
+        self.attn = DualSpectralAttention(config.d_model, config.n_heads)
 
         # Cross-band mixer (MLP)
         self.mlp = SpectralMLP(config.d_model, config.mlp_ratio)
@@ -411,11 +671,8 @@ class SpectralGatedLayer(nn.Module):
         Returns:
             Output tensor [batch, seq_len, d_model]
         """
-        # Time-mixing
-        h = self.conv(x)
-
-        # Spectral gating
-        h = self.gate(h)
+        # Spectral attention
+        h = self.attn(x)
 
         # First residual + norm
         x = self.norm1(x + h)
@@ -439,11 +696,8 @@ class SpectralGatedLayer(nn.Module):
         Returns:
             Output tensor [batch, seq_len, cutoff]
         """
-        # Time-mixing (sliced)
-        h = self.conv.forward_sliced(x, cutoff)
-
-        # Spectral gating (sliced)
-        h = self.gate.forward_sliced(h, cutoff)
+        # Spectral attention (sliced)
+        h = self.attn.forward_sliced(x, cutoff)
 
         # First residual + norm
         x = self.norm1(x + h)
