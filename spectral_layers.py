@@ -377,17 +377,27 @@ class SpectralAttention(nn.Module):
         """
         batch, seq_len, _ = x.shape
 
-        # Calculate active heads (may be partial)
+        # Calculate active heads - must align to head boundaries
+        # We use as many complete heads as fit in the cutoff
         n_heads_active = max(1, cutoff // self.head_dim)
-        head_dim_active = cutoff // n_heads_active
+        # Keep the original head_dim (don't change it based on cutoff)
+        head_dim_active = self.head_dim
+        # The actual dimension we'll use for attention (aligned to head boundary)
+        aligned_dim = n_heads_active * head_dim_active
 
-        # Slice projection weights
-        Q = F.linear(x, self.W_q.weight[:cutoff, :cutoff])
-        K = F.linear(x, self.W_k.weight[:cutoff, :cutoff])
-        V = F.linear(x, self.W_v.weight[:cutoff, :cutoff])
+        # If cutoff is smaller than one head, use cutoff as a single "head"
+        if cutoff < self.head_dim:
+            n_heads_active = 1
+            head_dim_active = cutoff
+            aligned_dim = cutoff
 
-        # Get sliced frequency and pool weights
-        freq_weights = self.get_freq_weights(cutoff)
+        # Slice projection weights to aligned dimensions
+        Q = F.linear(x, self.W_q.weight[:aligned_dim, :cutoff])
+        K = F.linear(x, self.W_k.weight[:aligned_dim, :cutoff])
+        V = F.linear(x, self.W_v.weight[:aligned_dim, :cutoff])
+
+        # Get sliced frequency and pool weights (for aligned_dim)
+        freq_weights = self.get_freq_weights(aligned_dim)
         pool_weights = self.get_pool_weights()
 
         # Compute spectral scores (sliced version)
@@ -407,9 +417,11 @@ class SpectralAttention(nn.Module):
         V = V.view(batch, seq_len, n_heads_active, head_dim_active).transpose(1, 2)
         out = torch.matmul(attn, V)
 
-        # Reshape and project output (sliced)
-        out = out.transpose(1, 2).contiguous().view(batch, seq_len, cutoff)
-        out = F.linear(out, self.W_o.weight[:cutoff, :cutoff])
+        # Reshape back to aligned_dim
+        out = out.transpose(1, 2).contiguous().view(batch, seq_len, aligned_dim)
+
+        # Project output back to cutoff dimensions
+        out = F.linear(out, self.W_o.weight[:cutoff, :aligned_dim])
 
         return out
 
@@ -426,9 +438,9 @@ class SpectralAttention(nn.Module):
         Compute spectral attention scores with sliced dimensions.
 
         Args:
-            Q: Query tensor [batch, seq, cutoff]
-            K: Key tensor [batch, seq, cutoff]
-            freq_weights: Sliced frequency weights [cutoff]
+            Q: Query tensor [batch, seq, aligned_dim]
+            K: Key tensor [batch, seq, aligned_dim]
+            freq_weights: Sliced frequency weights [aligned_dim]
             pool_weights: Pool weights [pool_width]
             n_heads: Number of active heads
             head_dim: Active head dimension
@@ -436,7 +448,7 @@ class SpectralAttention(nn.Module):
         Returns:
             Attention scores [batch, n_heads, seq, seq]
         """
-        batch, seq_len, cutoff = Q.shape
+        batch, seq_len, aligned_dim = Q.shape
 
         # Apply frequency weighting
         Q_weighted = Q * freq_weights
@@ -444,7 +456,7 @@ class SpectralAttention(nn.Module):
         # Reshape to heads
         Q_heads = Q_weighted.view(batch, seq_len, n_heads, head_dim).transpose(1, 2)
 
-        # Pad K for pooling
+        # Pad K in frequency dimension for pooling
         K_padded = F.pad(K, (self.pool_pad, self.pool_pad), mode="constant", value=0)
 
         # Accumulate scores across frequency offsets
@@ -452,7 +464,7 @@ class SpectralAttention(nn.Module):
 
         for offset_idx, offset in enumerate(range(-self.pool_pad, self.pool_pad + 1)):
             start = self.pool_pad + offset
-            end = start + cutoff
+            end = start + aligned_dim
             K_shifted = K_padded[:, :, start:end]
 
             K_heads = K_shifted.view(batch, seq_len, n_heads, head_dim).transpose(1, 2)
