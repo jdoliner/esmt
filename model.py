@@ -11,6 +11,7 @@ from spectral_layers import (
     MatryoshkaEmbedding,
     MatryoshkaPositionalEmbedding,
     SpectralBlock,
+    SpectralBlockV2,
 )
 
 
@@ -21,6 +22,10 @@ class SpectralGPT(nn.Module):
     This is now a direct replica of NanoGPT's architecture with support for
     elastic inference via bandwidth truncation. The goal is to match NanoGPT's
     performance exactly, then add spectral features incrementally.
+    
+    Experimental features (controlled via config):
+    - use_spectral_blur: Use SpectralBlurMLP with local conv instead of dense MLP
+    - use_harmonic_mixing: Add octave skip connections (f <-> 2f)
     """
 
     def __init__(self, config: ESMTConfig):
@@ -37,10 +42,17 @@ class SpectralGPT(nn.Module):
         self.token_emb = MatryoshkaEmbedding(config.vocab_size, config.d_model)
         self.pos_emb = MatryoshkaPositionalEmbedding(config.seq_len, config.d_model)
 
-        # Stack of transformer blocks (identical to NanoGPT)
-        self.layers = nn.ModuleList(
-            [SpectralBlock(config) for _ in range(config.n_layers)]
-        )
+        # Stack of transformer blocks
+        # Use SpectralBlockV2 if any experimental features are enabled
+        use_experimental = config.use_spectral_blur or config.use_harmonic_mixing
+        if use_experimental:
+            self.layers = nn.ModuleList(
+                [SpectralBlockV2(config) for _ in range(config.n_layers)]
+            )
+        else:
+            self.layers = nn.ModuleList(
+                [SpectralBlock(config) for _ in range(config.n_layers)]
+            )
 
         # Final layer norm (same as NanoGPT)
         self.ln_f = nn.LayerNorm(config.d_model, eps=config.eps)

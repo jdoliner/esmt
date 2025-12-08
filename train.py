@@ -545,6 +545,34 @@ def main():
         default=None,
         help="Run name for TensorBoard logging (default: model name)",
     )
+    
+    # ===========================================================================
+    # Experimental Spectral Features
+    # ===========================================================================
+    parser.add_argument(
+        "--spectral_blur",
+        action="store_true",
+        help="Enable SpectralBlurMLP: local feature mixing via 1D convolution",
+    )
+    parser.add_argument(
+        "--blur_kernel",
+        type=int,
+        default=3,
+        choices=[3, 5, 7],
+        help="Kernel size for spectral blur convolution (default: 3)",
+    )
+    parser.add_argument(
+        "--harmonic",
+        action="store_true",
+        help="Enable HarmonicMixing: octave skip connections (f <-> 2f)",
+    )
+    parser.add_argument(
+        "--n_octaves",
+        type=int,
+        default=3,
+        choices=[1, 2, 3, 4],
+        help="Number of octave levels for harmonic mixing (default: 3)",
+    )
 
     args = parser.parse_args()
 
@@ -555,11 +583,19 @@ def main():
     esmt_config = ESMTConfig(
         d_model=args.d_model,
         n_layers=args.n_layers,
+        # Experimental features
+        use_spectral_blur=args.spectral_blur,
+        blur_kernel_size=args.blur_kernel,
+        use_harmonic_mixing=args.harmonic,
+        n_octaves=args.n_octaves,
     )
     nano_config = NanoGPTConfig(
         d_model=args.d_model,
         n_layers=args.n_layers,
     )
+    
+    # Print experiment configuration
+    print(f"Experimental features: {esmt_config.experiment_summary()}")
     train_config = TrainConfig(
         batch_size=args.batch_size,
         lr=args.lr,

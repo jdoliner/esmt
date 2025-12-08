@@ -16,14 +16,39 @@ class ESMTConfig:
     mlp_ratio: int = 4  # MLP expansion ratio (d_model -> mlp_ratio * d_model)
     dropout: float = 0.0  # Dropout rate (0 for this experiment)
     eps: float = 1e-6  # LayerNorm epsilon
+    
+    # ===========================================================================
+    # Experimental Spectral Features
+    # ===========================================================================
+    
+    # Spectral Blur: Replace dense feature mixing with local 1D convolution
+    # Forces the model to organize information smoothly along the feature dimension
+    use_spectral_blur: bool = False
+    blur_kernel_size: int = 3  # Kernel size for feature-axis convolution (3, 5, or 7)
+    
+    # Harmonic Mixing: Connect features at octave intervals (f <-> 2f <-> 4f)
+    # Enables multi-scale reasoning by wiring different "resolution levels"
+    use_harmonic_mixing: bool = False
+    n_octaves: int = 3  # Number of octave levels to connect (1, 2, or 3)
 
     def __post_init__(self):
         assert self.d_model % 2 == 0, "d_model must be even"
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
+        assert self.blur_kernel_size % 2 == 1, "blur_kernel_size must be odd"
+        assert 1 <= self.n_octaves <= 4, "n_octaves must be between 1 and 4"
 
     @property
     def head_dim(self) -> int:
         return self.d_model // self.n_heads
+    
+    def experiment_summary(self) -> str:
+        """Return a summary of enabled experimental features."""
+        features = []
+        if self.use_spectral_blur:
+            features.append(f"SpectralBlur(k={self.blur_kernel_size})")
+        if self.use_harmonic_mixing:
+            features.append(f"Harmonic(oct={self.n_octaves})")
+        return ", ".join(features) if features else "Baseline (no experiments)"
 
 
 @dataclass
