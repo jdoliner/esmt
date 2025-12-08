@@ -73,13 +73,22 @@ class SpectralAttention(nn.Module):
         """Forward with sliced weights for elastic inference."""
         batch, seq_len, _ = x.shape
 
-        n_heads_active = cutoff // self.head_dim
-        if n_heads_active == 0:
-            n_heads_active = 1
-        head_dim_active = cutoff // n_heads_active
+        # Calculate aligned dimensions for attention
+        # We need n_heads * head_dim to equal our working dimension
+        n_heads_active = max(1, cutoff // self.head_dim)
+        # Keep original head_dim, align total dimension to head boundary
+        aligned_dim = n_heads_active * self.head_dim
 
-        # Slice QKV weights
-        qkv_weight = self.qkv.weight[: 3 * cutoff, :cutoff]
+        # Handle case where cutoff < head_dim
+        if cutoff < self.head_dim:
+            n_heads_active = 1
+            aligned_dim = cutoff
+            head_dim_active = cutoff
+        else:
+            head_dim_active = self.head_dim
+
+        # Project input to aligned QKV dimension
+        qkv_weight = self.qkv.weight[: 3 * aligned_dim, :cutoff]
         qkv = F.linear(x, qkv_weight)
 
         q, k, v = qkv.chunk(3, dim=-1)
@@ -96,10 +105,11 @@ class SpectralAttention(nn.Module):
         attn = F.softmax(attn, dim=-1)
         out = attn @ v
 
-        out = out.transpose(1, 2).contiguous().view(batch, seq_len, cutoff)
+        # Reshape back to aligned_dim
+        out = out.transpose(1, 2).contiguous().view(batch, seq_len, aligned_dim)
 
-        # Project
-        proj_weight = self.proj.weight[:cutoff, :cutoff]
+        # Project back to cutoff dimensions
+        proj_weight = self.proj.weight[:cutoff, :aligned_dim]
         out = F.linear(out, proj_weight)
 
         return out
