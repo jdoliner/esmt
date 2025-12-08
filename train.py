@@ -375,16 +375,16 @@ def train_model(
                 logger.log_gradient_norms(grad_norms, global_step)
             
             # Log spectral diagnostics less frequently (every 100 steps)
-            if global_step % 100 == 0 and use_matryoshka:
-                spectral_stats = collect_spectral_diagnostics(model)
-                if spectral_stats:
-                    logger.log_spectral_diagnostics(spectral_stats, global_step)
-                    
-                # Log filter weight histograms even less frequently (every 500 steps)
-                if global_step % 500 == 0:
-                    filter_weights = collect_filter_weights(model)
-                    if filter_weights:
-                        logger.log_filter_histograms(filter_weights, global_step)
+            # if global_step % 100 == 0 and use_matryoshka:
+            #     spectral_stats = collect_spectral_diagnostics(model)
+            #     if spectral_stats:
+            #         logger.log_spectral_diagnostics(spectral_stats, global_step)
+            #         
+            #     # Log filter weight histograms even less frequently (every 500 steps)
+            #     if global_step % 500 == 0:
+            #         filter_weights = collect_filter_weights(model)
+            #         if filter_weights:
+            #             logger.log_filter_histograms(filter_weights, global_step)
 
             # Evaluation at intervals
             if (global_step + 1) % train_config.eval_interval == 0:
