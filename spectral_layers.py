@@ -380,19 +380,12 @@ class SpectralBlurMLP(nn.Module):
 
 class HarmonicMixing(nn.Module):
     """
-    Mix features at octave intervals (f <-> 2f <-> 4f).
+    DEPRECATED: Original bidirectional harmonic mixing.
+    Use MatryoshkaHarmonicMixing instead for Matryoshka-compatible training.
     
-    The key insight: In physics and music, frequencies are related not just to
-    neighbors but to harmonics (f, 2f, 4f, ...). Language has similar multi-scale
-    structure: words -> sentences -> paragraphs -> documents.
-    
-    By wiring f <-> 2f, we give the model a dedicated highway to move information
-    between different structural scales without passing through intermediate steps.
-    
-    Implementation:
-        - For each feature index i, we connect it to 2i and i//2
-        - Connections are weighted and learnable
-        - The mixing is additive (residual-style)
+    This version has bidirectional flow (low<->high) which breaks when truncated
+    because high-frequency features that send information to low-frequency
+    features may not exist at reduced bandwidths.
     """
 
     def __init__(self, d_model: int, n_octaves: int = 3):
@@ -400,25 +393,14 @@ class HarmonicMixing(nn.Module):
         self.d_model = d_model
         self.n_octaves = n_octaves
         
-        # Learnable mixing weights for each octave level
-        # Initialize small so harmonic mixing is initially weak
         self.up_weights = nn.Parameter(torch.ones(n_octaves) * 0.1)
         self.down_weights = nn.Parameter(torch.ones(n_octaves) * 0.1)
-        
-        # Pre-compute index mappings for efficiency
-        # We'll build these as buffers
         self._build_index_maps()
 
     def _build_index_maps(self):
-        """Pre-compute octave index mappings."""
-        # For each octave level, compute source->target index pairs
-        up_indices = []  # low freq -> high freq (i -> 2i)
-        down_indices = []  # high freq -> low freq (i -> i//2)
-        
         for octave in range(1, self.n_octaves + 1):
             stride = 2 ** octave
             
-            # Upsample: feature[i] contributes to feature[i * stride]
             up_src, up_tgt = [], []
             for i in range(self.d_model // stride):
                 tgt_idx = i * stride
@@ -427,94 +409,172 @@ class HarmonicMixing(nn.Module):
                     up_tgt.append(tgt_idx)
             
             if up_src:
-                self.register_buffer(
-                    f'up_src_{octave}', 
-                    torch.tensor(up_src, dtype=torch.long)
-                )
-                self.register_buffer(
-                    f'up_tgt_{octave}', 
-                    torch.tensor(up_tgt, dtype=torch.long)
-                )
+                self.register_buffer(f'up_src_{octave}', torch.tensor(up_src, dtype=torch.long))
+                self.register_buffer(f'up_tgt_{octave}', torch.tensor(up_tgt, dtype=torch.long))
             
-            # Downsample: feature[i * stride] contributes to feature[i]
             down_src, down_tgt = [], []
             for i in range(stride, self.d_model, 1):
-                src_idx = i
-                tgt_idx = i // stride
-                down_src.append(src_idx)
-                down_tgt.append(tgt_idx)
+                down_src.append(i)
+                down_tgt.append(i // stride)
             
             if down_src:
-                self.register_buffer(
-                    f'down_src_{octave}', 
-                    torch.tensor(down_src, dtype=torch.long)
-                )
-                self.register_buffer(
-                    f'down_tgt_{octave}', 
-                    torch.tensor(down_tgt, dtype=torch.long)
-                )
+                self.register_buffer(f'down_src_{octave}', torch.tensor(down_src, dtype=torch.long))
+                self.register_buffer(f'down_tgt_{octave}', torch.tensor(down_tgt, dtype=torch.long))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Apply harmonic mixing.
-        
-        Args:
-            x: [batch, seq, d_model]
-        Returns:
-            [batch, seq, d_model] with harmonic connections mixed in
-        """
         out = x.clone()
-        
         for octave in range(1, self.n_octaves + 1):
-            # Get weights (sigmoid to keep bounded)
             up_w = torch.sigmoid(self.up_weights[octave - 1])
             down_w = torch.sigmoid(self.down_weights[octave - 1])
             
-            # Upsample contribution: low-freq info flows to high-freq positions
             up_src = getattr(self, f'up_src_{octave}', None)
             up_tgt = getattr(self, f'up_tgt_{octave}', None)
             if up_src is not None and up_tgt is not None:
-                # x[..., up_tgt] += up_w * x[..., up_src]
-                contribution = up_w * x[..., up_src]
-                out = out.index_add(-1, up_tgt, contribution)
+                out = out.index_add(-1, up_tgt, up_w * x[..., up_src])
             
-            # Downsample contribution: high-freq info aggregates to low-freq
             down_src = getattr(self, f'down_src_{octave}', None)
             down_tgt = getattr(self, f'down_tgt_{octave}', None)
             if down_src is not None and down_tgt is not None:
-                contribution = down_w * x[..., down_src]
-                out = out.index_add(-1, down_tgt, contribution)
-        
+                out = out.index_add(-1, down_tgt, down_w * x[..., down_src])
         return out
 
     def forward_sliced(self, x: torch.Tensor, cutoff: int) -> torch.Tensor:
-        """Forward with sliced dimensions for elastic inference."""
         out = x.clone()
-        
         for octave in range(1, self.n_octaves + 1):
             up_w = torch.sigmoid(self.up_weights[octave - 1])
             down_w = torch.sigmoid(self.down_weights[octave - 1])
             
-            # Filter indices to those within cutoff
             up_src = getattr(self, f'up_src_{octave}', None)
             up_tgt = getattr(self, f'up_tgt_{octave}', None)
             if up_src is not None and up_tgt is not None:
-                # Only use indices within cutoff
                 mask = (up_src < cutoff) & (up_tgt < cutoff)
                 if mask.any():
-                    src_filtered = up_src[mask]
-                    tgt_filtered = up_tgt[mask]
-                    contribution = up_w * x[..., src_filtered]
-                    out = out.index_add(-1, tgt_filtered, contribution)
+                    out = out.index_add(-1, up_tgt[mask], up_w * x[..., up_src[mask]])
             
             down_src = getattr(self, f'down_src_{octave}', None)
             down_tgt = getattr(self, f'down_tgt_{octave}', None)
             if down_src is not None and down_tgt is not None:
                 mask = (down_src < cutoff) & (down_tgt < cutoff)
                 if mask.any():
-                    src_filtered = down_src[mask]
-                    tgt_filtered = down_tgt[mask]
-                    contribution = down_w * x[..., src_filtered]
+                    out = out.index_add(-1, down_tgt[mask], down_w * x[..., down_src[mask]])
+        return out
+
+
+class MatryoshkaHarmonicMixing(nn.Module):
+    """
+    Matryoshka-safe harmonic mixing: information flows FROM low frequencies TO high frequencies.
+    
+    The key insight: In Matryoshka training, we truncate high frequencies during training.
+    If high frequencies send information to low frequencies, the low frequencies become
+    dependent on features that won't exist at inference time with reduced bandwidth.
+    
+    Solution: Only allow UPWARD flow (low -> high). Low frequencies must be self-sufficient.
+    High frequencies can receive context from low frequencies (like a "topic" signal),
+    but cannot contribute back.
+    
+    This is like a "waterfall" - information cascades from coarse (low freq) to fine (high freq),
+    but never flows uphill.
+    
+    Architecture:
+        - Feature[i] sends information to Feature[i * 2^octave] (upward only)
+        - The low-frequency "core" (indices 0 to min_bandwidth * d_model) is self-contained
+        - Higher frequencies receive conditioning from lower frequencies
+    """
+
+    def __init__(self, d_model: int, n_octaves: int = 3, min_bandwidth: float = 0.25):
+        super().__init__()
+        self.d_model = d_model
+        self.n_octaves = n_octaves
+        self.min_bandwidth = min_bandwidth
+        self.min_cutoff = int(d_model * min_bandwidth)
+        
+        # Learnable mixing weights for each octave level (upward flow only)
+        # Initialize small so mixing starts weak and grows if useful
+        self.weights = nn.Parameter(torch.ones(n_octaves) * 0.1)
+        
+        # Pre-compute index mappings
+        self._build_index_maps()
+
+    def _build_index_maps(self):
+        """
+        Build index maps for upward-only harmonic flow.
+        
+        Key constraint: Source indices must be in the "safe zone" (< min_cutoff)
+        so they always exist regardless of bandwidth truncation.
+        """
+        for octave in range(1, self.n_octaves + 1):
+            stride = 2 ** octave
+            
+            src_indices = []
+            tgt_indices = []
+            
+            # Only sources from the always-present low-frequency region
+            # can send to higher frequencies
+            for i in range(self.min_cutoff):
+                tgt_idx = i * stride
+                # Target must be within full d_model (may be truncated at inference)
+                if tgt_idx < self.d_model and tgt_idx >= self.min_cutoff:
+                    src_indices.append(i)
+                    tgt_indices.append(tgt_idx)
+            
+            if src_indices:
+                self.register_buffer(
+                    f'src_{octave}',
+                    torch.tensor(src_indices, dtype=torch.long)
+                )
+                self.register_buffer(
+                    f'tgt_{octave}',
+                    torch.tensor(tgt_indices, dtype=torch.long)
+                )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply Matryoshka-safe harmonic mixing (upward flow only).
+        
+        Args:
+            x: [batch, seq, d_model]
+        Returns:
+            [batch, seq, d_model] with harmonic conditioning from low to high freq
+        """
+        out = x.clone()
+        
+        for octave in range(1, self.n_octaves + 1):
+            weight = torch.sigmoid(self.weights[octave - 1])
+            
+            src = getattr(self, f'src_{octave}', None)
+            tgt = getattr(self, f'tgt_{octave}', None)
+            
+            if src is not None and tgt is not None:
+                # High frequencies receive information from low frequencies
+                # out[..., tgt] += weight * x[..., src]
+                contribution = weight * x[..., src]
+                out = out.index_add(-1, tgt, contribution)
+        
+        return out
+
+    def forward_sliced(self, x: torch.Tensor, cutoff: int) -> torch.Tensor:
+        """
+        Forward with bandwidth truncation.
+        
+        Because sources are always from the low-frequency safe zone,
+        this naturally works - we just filter targets to those within cutoff.
+        """
+        out = x.clone()
+        
+        for octave in range(1, self.n_octaves + 1):
+            weight = torch.sigmoid(self.weights[octave - 1])
+            
+            src = getattr(self, f'src_{octave}', None)
+            tgt = getattr(self, f'tgt_{octave}', None)
+            
+            if src is not None and tgt is not None:
+                # Filter to targets within current cutoff
+                # Sources are always valid (in safe zone)
+                mask = tgt < cutoff
+                if mask.any():
+                    src_filtered = src[mask]
+                    tgt_filtered = tgt[mask]
+                    contribution = weight * x[..., src_filtered]
                     out = out.index_add(-1, tgt_filtered, contribution)
         
         return out
@@ -548,11 +608,16 @@ class SpectralBlockV2(nn.Module):
         else:
             self.mlp = SpectralMLP(config)
         
-        # Optional harmonic mixing
+        # Optional harmonic mixing (Matryoshka-safe version)
         use_harmonic = getattr(config, 'use_harmonic_mixing', False)
         n_octaves = getattr(config, 'n_octaves', 3)
         if use_harmonic:
-            self.harmonic = HarmonicMixing(config.d_model, n_octaves=n_octaves)
+            # Use Matryoshka-safe version that only allows upward flow (low -> high)
+            self.harmonic = MatryoshkaHarmonicMixing(
+                config.d_model, 
+                n_octaves=n_octaves,
+                min_bandwidth=0.25  # Match training min_bandwidth
+            )
         else:
             self.harmonic = None
 
