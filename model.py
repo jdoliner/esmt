@@ -10,8 +10,7 @@ from config import ESMTConfig, NanoGPTConfig
 from spectral_layers import (
     MatryoshkaEmbedding,
     MatryoshkaPositionalEmbedding,
-    SpectralGatedLayer,
-    SpectralNorm,
+    SpectralBlock,
 )
 
 
@@ -19,8 +18,9 @@ class SpectralGPT(nn.Module):
     """
     Elastic Spectral Matryoshka Transformer (ESMT).
 
-    A novel Transformer architecture that treats token embeddings as spectral
-    wave packets, enabling elastic inference through bandwidth truncation.
+    This is now a direct replica of NanoGPT's architecture with support for
+    elastic inference via bandwidth truncation. The goal is to match NanoGPT's
+    performance exactly, then add spectral features incrementally.
     """
 
     def __init__(self, config: ESMTConfig):
@@ -33,23 +33,20 @@ class SpectralGPT(nn.Module):
         super().__init__()
         self.config = config
 
-        # Token and positional embeddings (Matryoshka-aware)
+        # Token and positional embeddings (with truncation support)
         self.token_emb = MatryoshkaEmbedding(config.vocab_size, config.d_model)
         self.pos_emb = MatryoshkaPositionalEmbedding(config.seq_len, config.d_model)
 
-        # Stack of Spectral Gated Layers
+        # Stack of transformer blocks (identical to NanoGPT)
         self.layers = nn.ModuleList(
-            [SpectralGatedLayer(config) for _ in range(config.n_layers)]
+            [SpectralBlock(config) for _ in range(config.n_layers)]
         )
 
-        # Final normalization
-        self.final_norm = SpectralNorm(config.eps)
+        # Final layer norm (same as NanoGPT)
+        self.ln_f = nn.LayerNorm(config.d_model, eps=config.eps)
 
         # Output projection to vocabulary
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-
-        # Weight tying (optional but common)
-        # self.lm_head.weight = self.token_emb.embedding.weight
 
         # Initialize weights
         self.apply(self._init_weights)
@@ -62,6 +59,9 @@ class SpectralGPT(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
 
     def forward(
         self, x: torch.Tensor, bandwidth_ratio: float = 1.0
@@ -80,8 +80,8 @@ class SpectralGPT(nn.Module):
         cutoff = int(self.config.d_model * bandwidth_ratio)
 
         # Get embeddings (truncated if bandwidth < 1.0)
-        tok_emb = self.token_emb(x, bandwidth_ratio)  # [batch, seq_len, cutoff]
-        pos_emb = self.pos_emb(seq_len, bandwidth_ratio)  # [1, seq_len, cutoff]
+        tok_emb = self.token_emb(x, bandwidth_ratio)
+        pos_emb = self.pos_emb(seq_len, bandwidth_ratio)
 
         h = tok_emb + pos_emb
 
@@ -89,36 +89,31 @@ class SpectralGPT(nn.Module):
         if bandwidth_ratio < 1.0:
             for layer in self.layers:
                 h = layer.forward_sliced(h, cutoff)
+            # Final layer norm (sliced)
+            h = F.layer_norm(
+                h,
+                (cutoff,),
+                self.ln_f.weight[:cutoff],
+                self.ln_f.bias[:cutoff] if self.ln_f.bias is not None else None,
+                self.ln_f.eps,
+            )
+            # Slice lm_head weights
+            logits = F.linear(h, self.lm_head.weight[:, :cutoff])
         else:
             for layer in self.layers:
                 h = layer(h)
-
-        # Final normalization
-        h = self.final_norm(h)
-
-        # Project to vocabulary (sliced if needed)
-        if bandwidth_ratio < 1.0:
-            # Slice lm_head weights: [vocab_size, d_model] -> [vocab_size, cutoff]
-            logits = F.linear(h, self.lm_head.weight[:, :cutoff])
-        else:
+            h = self.ln_f(h)
             logits = self.lm_head(h)
 
         return logits
 
     def get_spectral_regularization_loss(self) -> torch.Tensor:
         """
-        Collect spectral regularization loss from all layers.
-
-        This loss encourages the spectral attention to maintain its
-        frequency-aware properties rather than degenerating to standard attention.
-
-        Returns:
-            Scalar regularization loss (sum over all layers)
+        Returns zero (no regularization in baseline).
+        
+        Kept for API compatibility with training code.
         """
-        total_loss = torch.tensor(0.0, device=next(self.parameters()).device)
-        for layer in self.layers:
-            total_loss = total_loss + layer.get_regularization_loss()
-        return total_loss
+        return torch.tensor(0.0, device=next(self.parameters()).device)
 
 
 # ==============================================================================
