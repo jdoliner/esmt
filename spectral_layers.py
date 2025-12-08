@@ -147,16 +147,15 @@ class SpectralNorm(nn.Module):
 
 class SpectralAttention(nn.Module):
     """
-    Attention mechanism for frequency-domain representations.
+    Attention mechanism with optional frequency-domain structure.
 
-    Key differences from standard attention:
-    1. Frequency-weighted similarity (lower frequencies weighted more heavily)
-    2. Local pooling in frequency domain (adjacent frequencies interact)
-    3. Multi-head structure analogous to standard transformer attention
+    This is standard multi-head attention with two optional learnable additions:
+    1. Frequency weights: per-dimension scaling of Q before dot product
+    2. Frequency pooling: cross-frequency interaction in K
 
-    The frequency weighting exploits the Matryoshka structure where lower
-    frequency dimensions are more important. The pooling captures that
-    adjacent frequencies encode semantically related information.
+    Both are initialized to behave like standard attention (uniform weights,
+    center-only pooling) so the model starts equivalent to a standard transformer
+    and can learn spectral structure if it helps.
     """
 
     def __init__(
@@ -192,18 +191,16 @@ class SpectralAttention(nn.Module):
         self.W_o = nn.Linear(d_model, d_model, bias=False)
 
         # Learnable frequency weights (shared across heads)
-        # These will be constrained to be monotonically non-increasing
-        # Raw parameters - we transform these to get actual weights
-        self.freq_weight_raw = nn.Parameter(torch.zeros(d_model))
+        # Initialize to 1.0 (uniform) - model starts as standard attention
+        # No constraints - model is free to learn any weighting
+        self.freq_weights = nn.Parameter(torch.ones(d_model))
 
-        # Learnable pool weights (symmetric, shared across heads)
-        # Initialize with center-peaked pattern
+        # Learnable pool weights
+        # Initialize to [0, 1, 0] (center only) - model starts as standard attention
+        # No constraints - model is free to learn cross-frequency interactions
         pool_init = torch.zeros(pool_width)
-        pool_init[pool_width // 2] = 1.0  # Center weight = 1
-        if pool_width > 1:
-            pool_init[0] = 0.25  # Edge weights smaller
-            pool_init[-1] = 0.25
-        self.pool_weight_raw = nn.Parameter(pool_init)
+        pool_init[pool_width // 2] = 1.0  # Only center weight active
+        self.pool_weights = nn.Parameter(pool_init)
 
         # Causal mask buffer
         causal_mask = torch.tril(torch.ones(seq_len, seq_len)).view(
@@ -224,9 +221,7 @@ class SpectralAttention(nn.Module):
 
     def get_freq_weights(self, cutoff: int | None = None) -> torch.Tensor:
         """
-        Get monotonically non-increasing frequency weights.
-
-        Uses reverse cumsum of softplus to ensure weights[i] >= weights[i+1].
+        Get frequency weights for Q scaling.
 
         Args:
             cutoff: Optional dimension cutoff for elastic inference
@@ -236,27 +231,16 @@ class SpectralAttention(nn.Module):
         """
         if cutoff is None:
             cutoff = self.d_model
-
-        raw = self.freq_weight_raw[:cutoff]
-        # Softplus ensures positive increments
-        increments = F.softplus(raw)
-        # Reverse cumsum gives monotonically non-increasing values
-        # Starting from the highest frequency and accumulating backward
-        weights = torch.flip(torch.cumsum(torch.flip(increments, [0]), dim=0), [0])
-        return weights
+        return self.freq_weights[:cutoff]
 
     def get_pool_weights(self) -> torch.Tensor:
         """
-        Get symmetric, center-peaked pool weights.
+        Get pool weights for cross-frequency K interaction.
 
         Returns:
-            Pool weights of shape [pool_width], symmetric around center
+            Pool weights of shape [pool_width]
         """
-        # Make symmetric by averaging with flipped version
-        raw = self.pool_weight_raw
-        symmetric = (raw + torch.flip(raw, [0])) / 2
-        # Softplus to ensure positive
-        return F.softplus(symmetric)
+        return self.pool_weights
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -476,30 +460,16 @@ class SpectralAttention(nn.Module):
 
     def get_regularization_loss(self) -> torch.Tensor:
         """
-        Compute regularization loss to prevent degeneration to standard attention.
+        Regularization loss (disabled - returns 0).
 
-        Encourages:
-        1. Frequency weights to have meaningful variance (not uniform)
-        2. Pool weights to be center-peaked (not uniform)
+        The spectral structure is now optional and learnable, so we don't
+        penalize any particular configuration. The model is free to learn
+        standard attention (uniform weights) or spectral attention as needed.
 
         Returns:
-            Scalar regularization loss
+            Zero tensor (no regularization)
         """
-        freq_weights = self.get_freq_weights()
-        pool_weights = self.get_pool_weights()
-
-        # Encourage frequency weight variance (penalize uniformity)
-        freq_variance = freq_weights.var()
-        uniformity_penalty = 1.0 / (freq_variance + 1e-6)
-
-        # Encourage center-peaked pool weights
-        center_idx = self.pool_width // 2
-        center_weight = pool_weights[center_idx]
-        edge_weight = (pool_weights[0] + pool_weights[-1]) / 2
-        # Penalize if edges are larger than center
-        center_penalty = F.relu(edge_weight - center_weight)
-
-        return 0.01 * uniformity_penalty + 0.1 * center_penalty
+        return torch.tensor(0.0, device=self.freq_weights.device)
 
 
 class SpectralGate(nn.Module):
