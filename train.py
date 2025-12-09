@@ -262,8 +262,6 @@ def train_model(
     for epoch in range(train_config.epochs):
         model.train()
         epoch_loss = 0.0
-        epoch_loss_full = 0.0
-        epoch_loss_trunc = 0.0
         epoch_tokens = 0
         epoch_start_time = time.time()
 
@@ -285,37 +283,24 @@ def train_model(
             optimizer.zero_grad()
 
             with autocast("cuda", dtype=torch.bfloat16):
-                # Full bandwidth forward pass
-                logits_full = model(x, bandwidth_ratio=1.0)
-                loss_full = nn.functional.cross_entropy(
-                    logits_full.view(-1, logits_full.size(-1)), y.view(-1)
-                )
-
-                # Initialize variables that may not be set in all branches
-                bandwidth = 1.0
-                loss_trunc = torch.tensor(0.0, device=x.device)
-                reg_loss = torch.tensor(0.0, device=x.device)
-
+                # Matryoshka training: weighted stochastic bandwidth sampling
+                # Single forward pass per step for efficiency (~1x vs ~2.5x with dual pass)
                 if use_matryoshka:
-                    # Sample random bandwidth for truncated pass
-                    bandwidth = random.uniform(
-                        train_config.min_bandwidth, train_config.max_bandwidth
-                    )
-                    logits_trunc = model(x, bandwidth_ratio=bandwidth)
-                    loss_trunc = nn.functional.cross_entropy(
-                        logits_trunc.view(-1, logits_trunc.size(-1)), y.view(-1)
-                    )
-
-                    # Get spectral regularization loss (prevents degeneration to standard attention)
-                    # Access the underlying model if compiled
-                    base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-                    if hasattr(base_model, "get_spectral_regularization_loss"):
-                        reg_loss = base_model.get_spectral_regularization_loss()
-
-                    # Combined loss: LM loss + truncated loss + regularization
-                    loss = loss_full + train_config.lambda_trunc * loss_trunc + reg_loss
+                    # With probability full_bandwidth_prob, use full bandwidth
+                    # Otherwise, sample uniformly from [min_bandwidth, max_bandwidth]
+                    if random.random() < train_config.full_bandwidth_prob:
+                        bandwidth = 1.0
+                    else:
+                        bandwidth = random.uniform(
+                            train_config.min_bandwidth, train_config.max_bandwidth
+                        )
                 else:
-                    loss = loss_full
+                    bandwidth = 1.0
+                
+                logits = model(x, bandwidth_ratio=bandwidth)
+                loss = nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)), y.view(-1)
+                )
 
             # Backward pass with gradient scaling
             scaler.scale(loss).backward()
@@ -330,9 +315,6 @@ def train_model(
 
             # Logging
             epoch_loss += loss.item()
-            epoch_loss_full += loss_full.item()
-            if use_matryoshka:
-                epoch_loss_trunc += loss_trunc.item()
             
             # Track tokens processed
             epoch_tokens += tokens_per_batch
@@ -363,11 +345,7 @@ def train_model(
             # Log to TensorBoard
             if global_step % 10 == 0:
                 logger.log_scalar("train/loss", loss.item(), global_step)
-                logger.log_scalar("train/loss_full", loss_full.item(), global_step)
-                if use_matryoshka:
-                    logger.log_scalar("train/loss_trunc", loss_trunc.item(), global_step)
-                    logger.log_scalar("train/bandwidth", bandwidth, global_step)
-                    logger.log_scalar("train/reg_loss", reg_loss.item(), global_step)
+                logger.log_scalar("train/bandwidth", bandwidth, global_step)
                 logger.log_scalar("train/lr", lr, global_step)
                 
                 # Log gradient norms
@@ -416,11 +394,10 @@ def train_model(
         # End of epoch logging with high-level stats
         epoch_time = time.time() - epoch_start_time
         avg_loss = epoch_loss / len(train_loader)
-        avg_loss_full = epoch_loss_full / len(train_loader)
         epoch_tokens_per_sec = epoch_tokens / epoch_time if epoch_time > 0 else 0
         
         print(f"\nEpoch {epoch + 1} Summary:")
-        print(f"  Avg Loss: {avg_loss:.4f} | Avg Full Loss: {avg_loss_full:.4f}")
+        print(f"  Avg Loss: {avg_loss:.4f}")
         print(f"  Tokens processed: {epoch_tokens:,} | Time: {epoch_time:.1f}s | Throughput: {epoch_tokens_per_sec:,.0f} tok/s")
 
     # Final evaluation

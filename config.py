@@ -87,10 +87,12 @@ class TrainConfig:
     warmup_steps: int = 100  # Linear warmup steps
     epochs: int = 1  # Number of training epochs
 
-    # Matryoshka training
-    lambda_trunc: float = 1.0  # Weight for truncated loss
+    # Matryoshka training (weighted stochastic - single forward pass per step)
+    # Each step samples ONE bandwidth: full (100%) with prob=full_bandwidth_prob,
+    # otherwise uniform random from [min_bandwidth, max_bandwidth]
     min_bandwidth: float = 0.25  # Minimum bandwidth ratio (25%)
     max_bandwidth: float = 1.0  # Maximum bandwidth ratio (100%)
+    full_bandwidth_prob: float = 0.5  # Probability of training at full bandwidth
 
     # Evaluation
     eval_interval: int = 500  # Evaluate every N steps
