@@ -17,6 +17,12 @@ from tqdm import tqdm
 
 from config import ESMTConfig, NanoGPTConfig, TrainConfig
 from model import NanoGPT, SpectralGPT, count_parameters, create_matched_models
+from spectral_init import (
+    initialize_esmt_from_nanogpt,
+    freeze_embeddings,
+    count_frozen_parameters,
+    analyze_embedding_spectrum,
+)
 from utils import (
     TensorBoardLogger,
     Timer,
@@ -550,6 +556,37 @@ def main():
         choices=[1, 2, 3, 4],
         help="Number of octave levels for harmonic mixing (default: 3)",
     )
+    
+    # ===========================================================================
+    # Spectral Initialization from Pretrained NanoGPT
+    # ===========================================================================
+    parser.add_argument(
+        "--spectral_init",
+        type=str,
+        default=None,
+        metavar="CHECKPOINT",
+        help="Initialize ESMT embeddings from a pretrained NanoGPT checkpoint with DCT transform",
+    )
+    parser.add_argument(
+        "--no_dct_token",
+        action="store_true",
+        help="Don't apply DCT to token embeddings (only with --spectral_init)",
+    )
+    parser.add_argument(
+        "--no_dct_pos",
+        action="store_true",
+        help="Don't apply DCT to positional embeddings (only with --spectral_init)",
+    )
+    parser.add_argument(
+        "--no_dct_lm_head",
+        action="store_true",
+        help="Don't apply DCT to lm_head weights (only with --spectral_init)",
+    )
+    parser.add_argument(
+        "--freeze_embeddings",
+        action="store_true",
+        help="Freeze DCT'd embeddings during training (only with --spectral_init)",
+    )
 
     args = parser.parse_args()
 
@@ -565,6 +602,12 @@ def main():
         blur_kernel_size=args.blur_kernel,
         use_harmonic_mixing=args.harmonic,
         n_octaves=args.n_octaves,
+        # Spectral initialization
+        spectral_init_checkpoint=args.spectral_init,
+        dct_token_emb=not args.no_dct_token,
+        dct_pos_emb=not args.no_dct_pos,
+        dct_lm_head=not args.no_dct_lm_head,
+        freeze_embeddings=args.freeze_embeddings,
     )
     nano_config = NanoGPTConfig(
         d_model=args.d_model,
@@ -584,6 +627,36 @@ def main():
     # Create matched models
     print("Creating models with matched parameter counts...")
     esmt, nanogpt, esmt_config, nano_config = create_matched_models(esmt_config, nano_config)
+
+    # Apply spectral initialization if configured
+    if esmt_config.spectral_init_checkpoint:
+        print("\n" + "=" * 60)
+        print("Applying Spectral Initialization")
+        print("=" * 60)
+        esmt = initialize_esmt_from_nanogpt(
+            esmt,
+            esmt_config.spectral_init_checkpoint,
+            dct_token_emb=esmt_config.dct_token_emb,
+            dct_pos_emb=esmt_config.dct_pos_emb,
+            dct_lm_head=esmt_config.dct_lm_head,
+            verbose=True,
+        )
+        
+        # Freeze embeddings if configured
+        if esmt_config.freeze_embeddings:
+            print("\nFreezing DCT'd embeddings...")
+            freeze_embeddings(
+                esmt,
+                freeze_token=esmt_config.dct_token_emb,
+                freeze_pos=esmt_config.dct_pos_emb,
+                freeze_lm_head=esmt_config.dct_lm_head,
+            )
+            trainable, frozen = count_frozen_parameters(esmt)
+            print(f"  Trainable parameters: {format_params(trainable)}")
+            print(f"  Frozen parameters: {format_params(frozen)}")
+        
+        # Show initial spectral energy distribution
+        analyze_embedding_spectrum(esmt, "Initial Embedding Spectrum (after DCT init)")
 
     if args.model in ["esmt", "both"]:
         print("\n" + "=" * 60)

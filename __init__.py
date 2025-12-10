@@ -11,6 +11,15 @@ from spectral_layers import (
     SpectralMLP,
     SpectralNorm,
 )
+from spectral_init import (
+    dct_transform_tensor,
+    idct_transform_tensor,
+    initialize_esmt_from_nanogpt,
+    freeze_embeddings,
+    unfreeze_embeddings,
+    count_frozen_parameters,
+    analyze_embedding_spectrum,
+)
 
 __all__ = [
     # Configs
@@ -30,4 +39,12 @@ __all__ = [
     "SpectralGate",
     "SpectralMLP",
     "SpectralGatedLayer",
+    # Spectral initialization
+    "dct_transform_tensor",
+    "idct_transform_tensor",
+    "initialize_esmt_from_nanogpt",
+    "freeze_embeddings",
+    "unfreeze_embeddings",
+    "count_frozen_parameters",
+    "analyze_embedding_spectrum",
 ]

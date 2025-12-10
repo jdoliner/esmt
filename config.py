@@ -30,6 +30,23 @@ class ESMTConfig:
     # Enables multi-scale reasoning by wiring different "resolution levels"
     use_harmonic_mixing: bool = False
     n_octaves: int = 3  # Number of octave levels to connect (1, 2, or 3)
+    
+    # ===========================================================================
+    # Spectral Initialization from Pretrained NanoGPT
+    # ===========================================================================
+    
+    # Initialize embeddings from a pretrained NanoGPT checkpoint
+    # The embeddings are DCT-transformed to create an explicitly spectral basis
+    spectral_init_checkpoint: str | None = None  # Path to NanoGPT checkpoint
+    
+    # Which components to DCT-transform (only used when spectral_init_checkpoint is set)
+    dct_token_emb: bool = True   # DCT token embeddings
+    dct_pos_emb: bool = True     # DCT positional embeddings
+    dct_lm_head: bool = True     # DCT output projection (lm_head)
+    
+    # Whether to freeze DCT'd embeddings during training
+    # If True, only the transformer layers train; embeddings stay fixed
+    freeze_embeddings: bool = False
 
     def __post_init__(self):
         assert self.d_model % 2 == 0, "d_model must be even"
@@ -48,6 +65,16 @@ class ESMTConfig:
             features.append(f"SpectralBlur(k={self.blur_kernel_size})")
         if self.use_harmonic_mixing:
             features.append(f"Harmonic(oct={self.n_octaves})")
+        if self.spectral_init_checkpoint:
+            dct_parts = []
+            if self.dct_token_emb:
+                dct_parts.append("tok")
+            if self.dct_pos_emb:
+                dct_parts.append("pos")
+            if self.dct_lm_head:
+                dct_parts.append("head")
+            freeze_str = ",frozen" if self.freeze_embeddings else ""
+            features.append(f"SpectralInit({'+'.join(dct_parts)}{freeze_str})")
         return ", ".join(features) if features else "Baseline (no experiments)"
 
 
