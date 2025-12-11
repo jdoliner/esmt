@@ -283,11 +283,17 @@ def train_model(
 
     # Move model to device
     model = model.to(device)
+    
+    # Check if this is a complex model (affects compile and mixed precision)
+    is_complex_model = isinstance(model_config, ComplexESMTConfig)
 
     # Enable torch.compile for speedup (if supported)
-    if train_config.compile_model and hasattr(torch, "compile"):
+    # Note: torch.compile has limited support for complex ops (falls back to eager)
+    if train_config.compile_model and hasattr(torch, "compile") and not is_complex_model:
         print("Compiling model with torch.compile...")
         model = torch.compile(model)
+    elif is_complex_model and train_config.compile_model:
+        print("Skipping torch.compile for complex model (limited complex op support)")
 
     # Create data loaders
     train_loader = create_dataloader(
@@ -311,8 +317,15 @@ def train_model(
         weight_decay=train_config.weight_decay,
     )
 
-    # Mixed precision scaler
-    scaler = GradScaler("cuda")
+    # Complex models don't support GradScaler (AMP unscaling not implemented for complex)
+    if is_complex_model:
+        print("Complex model: disabling GradScaler (not supported for complex tensors)")
+        use_grad_scaler = False
+    else:
+        use_grad_scaler = True
+    
+    # Mixed precision scaler (only for real-valued models)
+    scaler = GradScaler("cuda") if use_grad_scaler else None
 
     # Logger
     logger = TensorBoardLogger(train_config.log_dir, model_name)
@@ -351,36 +364,55 @@ def train_model(
 
             optimizer.zero_grad()
 
-            with autocast("cuda", dtype=torch.bfloat16):
-                # Matryoshka training: weighted stochastic bandwidth sampling
-                # Single forward pass per step for efficiency (~1x vs ~2.5x with dual pass)
-                if use_matryoshka:
-                    # With probability full_bandwidth_prob, use full bandwidth
-                    # Otherwise, sample uniformly from [min_bandwidth, max_bandwidth]
-                    if random.random() < train_config.full_bandwidth_prob:
-                        bandwidth = 1.0
-                    else:
-                        bandwidth = random.uniform(
-                            train_config.min_bandwidth, train_config.max_bandwidth
-                        )
-                else:
+            # Matryoshka training: weighted stochastic bandwidth sampling
+            # Single forward pass per step for efficiency (~1x vs ~2.5x with dual pass)
+            if use_matryoshka:
+                # With probability full_bandwidth_prob, use full bandwidth
+                # Otherwise, sample uniformly from [min_bandwidth, max_bandwidth]
+                if random.random() < train_config.full_bandwidth_prob:
                     bandwidth = 1.0
+                else:
+                    bandwidth = random.uniform(
+                        train_config.min_bandwidth, train_config.max_bandwidth
+                    )
+            else:
+                bandwidth = 1.0
+            
+            if use_grad_scaler:
+                # Standard mixed precision training with GradScaler
+                with autocast("cuda", dtype=torch.bfloat16):
+                    logits = model(x, bandwidth_ratio=bandwidth)
+                    loss = nn.functional.cross_entropy(
+                        logits.view(-1, logits.size(-1)), y.view(-1)
+                    )
                 
+                # Backward pass with gradient scaling
+                scaler.scale(loss).backward()  # type: ignore
+
+                # Gradient clipping
+                scaler.unscale_(optimizer)  # type: ignore
+                torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
+
+                # Optimizer step
+                scaler.step(optimizer)  # type: ignore
+                scaler.update()  # type: ignore
+            else:
+                # Complex model: no GradScaler, but still use autocast for speed
+                # Note: autocast with bfloat16 may not work well with complex ops
+                # so we run in full precision (float32 for complex64)
                 logits = model(x, bandwidth_ratio=bandwidth)
                 loss = nn.functional.cross_entropy(
                     logits.view(-1, logits.size(-1)), y.view(-1)
                 )
-
-            # Backward pass with gradient scaling
-            scaler.scale(loss).backward()
-
-            # Gradient clipping
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
-
-            # Optimizer step
-            scaler.step(optimizer)
-            scaler.update()
+                
+                # Standard backward pass
+                loss.backward()
+                
+                # Gradient clipping (handles complex gradients via magnitude)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
+                
+                # Optimizer step
+                optimizer.step()
 
             # Logging
             epoch_loss += loss.item()
@@ -436,7 +468,8 @@ def train_model(
             # Evaluation at intervals
             if (global_step + 1) % train_config.eval_interval == 0:
                 val_losses = evaluate_spectral_sweep(
-                    model, val_loader, train_config.eval_bandwidths, device
+                    model, val_loader, train_config.eval_bandwidths, device,
+                    use_autocast=use_grad_scaler  # No autocast for complex models
                 )
                 logger.log_bandwidth_losses(val_losses, global_step, prefix="val")
 
@@ -472,7 +505,8 @@ def train_model(
     # Final evaluation
     print("\nFinal Evaluation:")
     val_losses = evaluate_spectral_sweep(
-        model, val_loader, train_config.eval_bandwidths, device
+        model, val_loader, train_config.eval_bandwidths, device,
+        use_autocast=use_grad_scaler  # No autocast for complex models
     )
     for bw, val_loss in val_losses.items():
         print(f"  Val Loss @ {int(bw * 100)}%: {val_loss:.4f}")
@@ -493,6 +527,7 @@ def evaluate_spectral_sweep(
     bandwidths: tuple[float, ...],
     device: torch.device,
     max_batches: int = 50,
+    use_autocast: bool = True,
 ) -> dict[float, float]:
     """
     Evaluate model at multiple bandwidth levels.
@@ -503,6 +538,7 @@ def evaluate_spectral_sweep(
         bandwidths: Tuple of bandwidth ratios to evaluate
         device: Device to use
         max_batches: Maximum batches to evaluate (for speed)
+        use_autocast: Whether to use autocast (False for complex models)
 
     Returns:
         Dictionary mapping bandwidth to loss
@@ -518,7 +554,13 @@ def evaluate_spectral_sweep(
         x, y = x.to(device), y.to(device)
 
         for bw in bandwidths:
-            with autocast("cuda", dtype=torch.bfloat16):
+            if use_autocast:
+                with autocast("cuda", dtype=torch.bfloat16):
+                    logits = model(x, bandwidth_ratio=bw)
+                    loss = nn.functional.cross_entropy(
+                        logits.view(-1, logits.size(-1)), y.view(-1)
+                    )
+            else:
                 logits = model(x, bandwidth_ratio=bw)
                 loss = nn.functional.cross_entropy(
                     logits.view(-1, logits.size(-1)), y.view(-1)
