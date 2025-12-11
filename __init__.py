@@ -1,7 +1,7 @@
 """Elastic Spectral Matryoshka Transformer (ESMT) package."""
 
-from config import ESMTConfig, NanoGPTConfig, TrainConfig
-from model import NanoGPT, SpectralGPT, count_parameters, create_matched_models
+from config import ESMTConfig, NanoGPTConfig, TrainConfig, ComplexESMTConfig
+from model import NanoGPT, SpectralGPT, ComplexSpectralGPT, count_parameters, create_matched_models
 from spectral_layers import (
     CausalConv1d,
     MatryoshkaEmbedding,
@@ -11,6 +11,19 @@ from spectral_layers import (
     SpectralMLP,
     SpectralNorm,
 )
+from complex_layers import (
+    ComplexLinear,
+    ModReLU,
+    ComplexLayerNorm,
+    ComplexEmbedding,
+    ComplexPositionalEncoding,
+    ComplexAttention,
+    ComplexFFN,
+    ComplexSpectralBlock,
+    ComplexToLogits,
+    ComplexSpectralGate,
+    ComplexSpectralGateDynamic,
+)
 from spectral_init import (
     dct_transform_tensor,
     idct_transform_tensor,
@@ -19,6 +32,13 @@ from spectral_init import (
     unfreeze_embeddings,
     count_frozen_parameters,
     analyze_embedding_spectrum,
+    # Complex initialization
+    fft_transform_tensor,
+    ifft_transform_tensor,
+    initialize_complex_esmt_from_nanogpt,
+    freeze_complex_embeddings,
+    unfreeze_complex_embeddings,
+    analyze_complex_embedding_spectrum,
 )
 
 __all__ = [
@@ -26,12 +46,14 @@ __all__ = [
     "ESMTConfig",
     "NanoGPTConfig",
     "TrainConfig",
+    "ComplexESMTConfig",
     # Models
     "SpectralGPT",
     "NanoGPT",
+    "ComplexSpectralGPT",
     "count_parameters",
     "create_matched_models",
-    # Layers
+    # Real-valued Layers
     "MatryoshkaEmbedding",
     "MatryoshkaPositionalEmbedding",
     "CausalConv1d",
@@ -39,7 +61,19 @@ __all__ = [
     "SpectralGate",
     "SpectralMLP",
     "SpectralGatedLayer",
-    # Spectral initialization
+    # Complex-valued Layers
+    "ComplexLinear",
+    "ModReLU",
+    "ComplexLayerNorm",
+    "ComplexEmbedding",
+    "ComplexPositionalEncoding",
+    "ComplexAttention",
+    "ComplexFFN",
+    "ComplexSpectralBlock",
+    "ComplexToLogits",
+    "ComplexSpectralGate",
+    "ComplexSpectralGateDynamic",
+    # Spectral initialization (DCT for real)
     "dct_transform_tensor",
     "idct_transform_tensor",
     "initialize_esmt_from_nanogpt",
@@ -47,4 +81,11 @@ __all__ = [
     "unfreeze_embeddings",
     "count_frozen_parameters",
     "analyze_embedding_spectrum",
+    # Spectral initialization (FFT for complex)
+    "fft_transform_tensor",
+    "ifft_transform_tensor",
+    "initialize_complex_esmt_from_nanogpt",
+    "freeze_complex_embeddings",
+    "unfreeze_complex_embeddings",
+    "analyze_complex_embedding_spectrum",
 ]

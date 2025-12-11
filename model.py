@@ -6,12 +6,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import ESMTConfig, NanoGPTConfig
+from config import ESMTConfig, NanoGPTConfig, ComplexESMTConfig
 from spectral_layers import (
     MatryoshkaEmbedding,
     MatryoshkaPositionalEmbedding,
     SpectralBlock,
     SpectralBlockV2,
+)
+from complex_layers import (
+    ComplexEmbedding,
+    ComplexPositionalEncoding,
+    ComplexSpectralBlock,
+    ComplexLayerNorm,
+    ComplexToLogits,
 )
 
 
@@ -397,6 +404,127 @@ class NanoGPT(nn.Module):
         logits = F.linear(h, self.lm_head.weight[:, :cutoff])
 
         return logits
+
+
+# ==============================================================================
+# Complex Spectral GPT
+# ==============================================================================
+
+
+class ComplexSpectralGPT(nn.Module):
+    """
+    Complex-valued Spectral Transformer.
+    
+    This model uses complex numbers throughout, providing:
+    - Native positional encoding via phase rotation (shift theorem)
+    - Phase-preserving activations (ModReLU)
+    - Complex attention with magnitude-based or phase-aware softmax
+    - Multiplicative residuals that are natural for complex numbers
+    
+    Key design choices:
+    - Embeddings are complex (learned real + imaginary)
+    - Positional encoding is applied via phase rotation, not addition
+    - Attention uses magnitude for softmax, preserving phase in values
+    - Output projects both magnitude and phase to logits
+    - Truncation always respects complex pairs (even cutoffs)
+    """
+    
+    def __init__(self, config: ComplexESMTConfig):
+        super().__init__()
+        self.config = config
+        
+        # Complex token embeddings
+        self.token_emb = ComplexEmbedding(config.vocab_size, config.d_model)
+        
+        # Phase-based positional encoding (shift theorem)
+        self.pos_enc = ComplexPositionalEncoding(
+            d_model=config.d_model,
+            max_len=config.max_pos_len,
+            base=config.pos_encoding_base
+        )
+        
+        # Stack of complex transformer blocks
+        self.layers = nn.ModuleList([
+            ComplexSpectralBlock(
+                d_model=config.d_model,
+                n_heads=config.n_heads,
+                seq_len=config.seq_len,
+                mlp_ratio=config.mlp_ratio,
+                attention_mode=config.attention_mode,
+                layernorm_mode=config.layernorm_mode,
+                residual_mode=config.residual_mode,
+                eps=config.eps,
+                dropout=config.dropout
+            )
+            for _ in range(config.n_layers)
+        ])
+        
+        # Final layer norm (complex)
+        self.ln_f = ComplexLayerNorm(
+            config.d_model, 
+            eps=config.eps, 
+            mode=config.layernorm_mode
+        )
+        
+        # Output projection: complex -> real logits
+        # Uses both magnitude and phase
+        self.lm_head = ComplexToLogits(config.d_model, config.vocab_size)
+    
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        bandwidth_ratio: float = 1.0
+    ) -> torch.Tensor:
+        """
+        Forward pass with optional bandwidth truncation.
+        
+        Args:
+            x: Input token indices [batch, seq_len]
+            bandwidth_ratio: Fraction of dimensions to use (0.25 to 1.0)
+        
+        Returns:
+            Logits [batch, seq_len, vocab_size]
+        """
+        batch, seq_len = x.shape
+        
+        # Calculate cutoff (must be even for complex pairs)
+        cutoff = int(self.config.d_model * bandwidth_ratio)
+        cutoff = max(2, cutoff - cutoff % 2)  # Ensure even
+        
+        # Get complex embeddings (truncated if bandwidth < 1.0)
+        h = self.token_emb(x, bandwidth_ratio)  # [batch, seq, d_model] complex
+        
+        # Apply positional encoding via phase rotation
+        if bandwidth_ratio < 1.0:
+            h = self.pos_enc.forward_sliced(h, cutoff, seq_len)
+        else:
+            h = self.pos_enc(h, seq_len)
+        
+        # Pass through transformer layers
+        if bandwidth_ratio < 1.0:
+            for layer in self.layers:
+                h = layer.forward_sliced(h, cutoff)
+            # Final layer norm (sliced)
+            h = self.ln_f.forward_sliced(h, cutoff)
+            # Project to logits (sliced)
+            logits = self.lm_head.forward_sliced(h, cutoff)
+        else:
+            for layer in self.layers:
+                h = layer(h)
+            h = self.ln_f(h)
+            logits = self.lm_head(h)
+        
+        return logits
+    
+    def get_spectral_regularization_loss(self) -> torch.Tensor:
+        """
+        Returns zero (no regularization in baseline).
+        
+        Could be extended to encourage spectral properties:
+        - Magnitude decay with frequency
+        - Phase coherence within semantic groups
+        """
+        return torch.tensor(0.0, device=next(self.parameters()).device)
 
 
 # ==============================================================================

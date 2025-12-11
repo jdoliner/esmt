@@ -15,13 +15,16 @@ import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
-from config import ESMTConfig, NanoGPTConfig, TrainConfig
-from model import NanoGPT, SpectralGPT, count_parameters, create_matched_models
+from config import ESMTConfig, NanoGPTConfig, TrainConfig, ComplexESMTConfig
+from model import NanoGPT, SpectralGPT, ComplexSpectralGPT, count_parameters, create_matched_models
 from spectral_init import (
     initialize_esmt_from_nanogpt,
     freeze_embeddings,
     count_frozen_parameters,
     analyze_embedding_spectrum,
+    initialize_complex_esmt_from_nanogpt,
+    freeze_complex_embeddings,
+    analyze_complex_embedding_spectrum,
 )
 from utils import (
     TensorBoardLogger,
@@ -115,7 +118,7 @@ def collect_gradient_norms(model: nn.Module) -> dict[str, float]:
     Collect gradient norms for different parameter groups.
     
     Args:
-        model: The model (SpectralGPT or NanoGPT)
+        model: The model (SpectralGPT, ComplexSpectralGPT, or NanoGPT)
         
     Returns:
         Dict mapping parameter group name to gradient norm
@@ -130,21 +133,29 @@ def collect_gradient_norms(model: nn.Module) -> dict[str, float]:
     conv_grads = []
     mlp_grads = []
     embedding_grads = []
+    attention_grads = []
     other_grads = []
     
     for name, param in model.named_parameters():
         if param.grad is None:
             continue
-        grad_norm = param.grad.norm().item()
+        
+        # Handle complex gradients (use magnitude)
+        if param.grad.is_complex():
+            grad_norm = param.grad.abs().norm().item()
+        else:
+            grad_norm = param.grad.norm().item()
         
         if "filter" in name:
             filter_grads.append(grad_norm)
         elif "conv" in name:
             conv_grads.append(grad_norm)
-        elif "mlp" in name or "fc1" in name or "fc2" in name:
+        elif "mlp" in name or "fc1" in name or "fc2" in name or "ffn" in name:
             mlp_grads.append(grad_norm)
         elif "emb" in name:
             embedding_grads.append(grad_norm)
+        elif "attn" in name or "qkv" in name or "proj" in name:
+            attention_grads.append(grad_norm)
         else:
             other_grads.append(grad_norm)
     
@@ -157,17 +168,69 @@ def collect_gradient_norms(model: nn.Module) -> dict[str, float]:
         norms["mlp_grad_norm"] = sum(mlp_grads) / len(mlp_grads)
     if embedding_grads:
         norms["embedding_grad_norm"] = sum(embedding_grads) / len(embedding_grads)
+    if attention_grads:
+        norms["attention_grad_norm"] = sum(attention_grads) / len(attention_grads)
     if other_grads:
         norms["other_grad_norm"] = sum(other_grads) / len(other_grads)
     
-    # Total gradient norm
+    # Total gradient norm (handle complex)
     total_norm = 0.0
     for param in model.parameters():
         if param.grad is not None:
-            total_norm += param.grad.norm().item() ** 2
+            if param.grad.is_complex():
+                total_norm += param.grad.abs().norm().item() ** 2
+            else:
+                total_norm += param.grad.norm().item() ** 2
     norms["total_grad_norm"] = total_norm ** 0.5
     
     return norms
+
+
+def collect_complex_diagnostics(model: nn.Module) -> dict[str, float]:
+    """
+    Collect diagnostic statistics specific to complex models.
+    
+    Args:
+        model: A ComplexSpectralGPT model
+        
+    Returns:
+        Dict with complex-specific metrics
+    """
+    stats = {}
+    
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+    
+    # Check if this is a complex model
+    if not hasattr(model, "token_emb") or not hasattr(model.token_emb, "embedding"):
+        return stats
+    
+    # Token embedding statistics
+    emb = model.token_emb.embedding.data
+    if emb.is_complex():
+        stats["emb_magnitude_mean"] = emb.abs().mean().item()
+        stats["emb_magnitude_std"] = emb.abs().std().item()
+        stats["emb_phase_std"] = emb.angle().std().item()
+    
+    # Collect per-layer statistics
+    if hasattr(model, "layers"):
+        for layer_idx, layer in enumerate(model.layers):
+            prefix = f"layer_{layer_idx}"
+            
+            # Attention QKV weights
+            if hasattr(layer, "attn") and hasattr(layer.attn, "qkv"):
+                qkv_weight = layer.attn.qkv.weight.data
+                if qkv_weight.is_complex():
+                    stats[f"{prefix}_attn_qkv_mag_mean"] = qkv_weight.abs().mean().item()
+                    stats[f"{prefix}_attn_qkv_phase_std"] = qkv_weight.angle().std().item()
+            
+            # FFN weights
+            if hasattr(layer, "ffn") and hasattr(layer.ffn, "fc1"):
+                fc1_weight = layer.ffn.fc1.weight.data
+                if fc1_weight.is_complex():
+                    stats[f"{prefix}_ffn_fc1_mag_mean"] = fc1_weight.abs().mean().item()
+    
+    return stats
 
 
 def get_lr(step: int, config: TrainConfig, total_steps: int) -> float:
@@ -197,7 +260,7 @@ import math
 def train_model(
     model: nn.Module,
     train_config: TrainConfig,
-    model_config: ESMTConfig | NanoGPTConfig,
+    model_config: ESMTConfig | NanoGPTConfig | ComplexESMTConfig,
     model_name: str,
     use_matryoshka: bool = True,
 ) -> nn.Module:
@@ -587,6 +650,48 @@ def main():
         action="store_true",
         help="Freeze DCT'd embeddings during training (only with --spectral_init)",
     )
+    
+    # ===========================================================================
+    # Complex Spectral Transformer Options
+    # ===========================================================================
+    parser.add_argument(
+        "--complex",
+        action="store_true",
+        help="Train ComplexSpectralGPT instead of real-valued ESMT",
+    )
+    parser.add_argument(
+        "--attention_mode",
+        type=str,
+        choices=["magnitude", "phase_aware"],
+        default="magnitude",
+        help="Complex attention mode: 'magnitude' (default) or 'phase_aware'",
+    )
+    parser.add_argument(
+        "--layernorm_mode",
+        type=str,
+        choices=["magnitude", "split"],
+        default="magnitude",
+        help="Complex LayerNorm mode: 'magnitude' (default) or 'split' (Trabelsi)",
+    )
+    parser.add_argument(
+        "--residual_mode",
+        type=str,
+        choices=["multiplicative", "additive"],
+        default="multiplicative",
+        help="Residual connection mode: 'multiplicative' (default) or 'additive'",
+    )
+    parser.add_argument(
+        "--fft_init",
+        type=str,
+        default=None,
+        metavar="CHECKPOINT",
+        help="Initialize ComplexSpectralGPT from NanoGPT checkpoint with FFT transform",
+    )
+    parser.add_argument(
+        "--freeze_complex_embeddings",
+        action="store_true",
+        help="Freeze FFT'd embeddings in complex model during training",
+    )
 
     args = parser.parse_args()
 
@@ -614,8 +719,6 @@ def main():
         n_layers=args.n_layers,
     )
     
-    # Print experiment configuration
-    print(f"Experimental features: {esmt_config.experiment_summary()}")
     train_config = TrainConfig(
         batch_size=args.batch_size,
         lr=args.lr,
@@ -623,6 +726,76 @@ def main():
         compile_model=not args.no_compile,
         seed=args.seed,
     )
+
+    # ===========================================================================
+    # Complex Spectral Transformer Training
+    # ===========================================================================
+    if args.complex:
+        print("\n" + "=" * 60)
+        print("Complex Spectral Transformer Mode")
+        print("=" * 60)
+        
+        # Create complex config
+        complex_config = ComplexESMTConfig(
+            d_model=args.d_model,
+            n_layers=args.n_layers,
+            attention_mode=args.attention_mode,
+            layernorm_mode=args.layernorm_mode,
+            residual_mode=args.residual_mode,
+            fft_init_checkpoint=args.fft_init,
+            freeze_embeddings=args.freeze_complex_embeddings,
+        )
+        
+        print(f"Complex model config: {complex_config.experiment_summary()}")
+        
+        # Create complex model
+        complex_model = ComplexSpectralGPT(complex_config)
+        print(f"ComplexSpectralGPT parameters: {format_params(count_parameters(complex_model))}")
+        
+        # Apply FFT initialization if configured
+        if complex_config.fft_init_checkpoint:
+            print("\n" + "=" * 60)
+            print("Applying FFT Initialization from NanoGPT")
+            print("=" * 60)
+            complex_model = initialize_complex_esmt_from_nanogpt(
+                complex_model,
+                complex_config.fft_init_checkpoint,
+                verbose=True,
+            )
+            
+            # Freeze embeddings if configured
+            if complex_config.freeze_embeddings:
+                print("\nFreezing FFT'd embeddings...")
+                freeze_complex_embeddings(complex_model)
+                trainable, frozen = count_frozen_parameters(complex_model)
+                print(f"  Trainable parameters: {format_params(trainable)}")
+                print(f"  Frozen parameters: {format_params(frozen)}")
+            
+            # Show initial spectral analysis
+            analyze_complex_embedding_spectrum(complex_model, "Initial Complex Embedding Analysis")
+        
+        # Train complex model
+        print("\n" + "=" * 60)
+        print("Training ComplexSpectralGPT (with Matryoshka loss)")
+        print("=" * 60)
+        complex_run_name = f"{args.run_name}_complex" if args.run_name else "complex_esmt"
+        complex_model = train_model(
+            complex_model,
+            train_config,
+            complex_config,
+            model_name=complex_run_name,
+            use_matryoshka=True,
+        )
+        
+        print("\nTraining complete!")
+        return
+    
+    # ===========================================================================
+    # Standard Real-Valued Training
+    # ===========================================================================
+    
+    # Print experiment configuration
+    print(f"Experimental features: {esmt_config.experiment_summary()}")
 
     # Create matched models
     print("Creating models with matched parameter counts...")

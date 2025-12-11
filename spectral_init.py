@@ -508,6 +508,290 @@ def count_frozen_parameters(model: nn.Module) -> tuple[int, int]:
     return trainable, frozen
 
 
+# ==============================================================================
+# FFT-based Initialization for Complex Spectral Transformer
+# ==============================================================================
+
+
+def fft_transform_tensor(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """
+    Apply FFT to transform real embeddings to complex spectral representation.
+    
+    Unlike DCT which produces real coefficients, FFT produces complex coefficients
+    which is what we need for the ComplexSpectralGPT.
+    
+    For real input, FFT has conjugate symmetry: X[k] = conj(X[N-k])
+    We keep only the first half (plus DC) which contains all the information.
+    
+    However, for our use case, we apply FFT to each embedding row and keep
+    all coefficients since we want to preserve the full complex representation.
+    
+    Args:
+        x: Real-valued input tensor
+        dim: Dimension along which to compute FFT
+        
+    Returns:
+        Complex tensor with same shape
+    """
+    return torch.fft.fft(x, dim=dim)
+
+
+def ifft_transform_tensor(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """
+    Apply inverse FFT to transform complex spectral back to real.
+    
+    Args:
+        x: Complex-valued input tensor
+        dim: Dimension along which to compute IFFT
+        
+    Returns:
+        Real tensor with same shape (takes real part since input was real)
+    """
+    result = torch.fft.ifft(x, dim=dim)
+    return result.real
+
+
+def extract_embeddings_from_nanogpt_for_complex(
+    checkpoint_path: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Extract embedding tables from a NanoGPT checkpoint for complex initialization.
+    
+    Args:
+        checkpoint_path: Path to NanoGPT checkpoint
+        
+    Returns:
+        Tuple of (token_embeddings, lm_head_weights)
+        - token_embeddings: [vocab_size, d_model]
+        - lm_head_weights: [vocab_size, d_model]
+        
+    Note: We don't extract positional embeddings because ComplexSpectralGPT
+    uses the shift theorem for positional encoding instead.
+    """
+    checkpoint = load_nanogpt_checkpoint(checkpoint_path)
+    state_dict = checkpoint["model_state_dict"]
+    
+    token_emb = state_dict["token_emb.weight"]  # [vocab_size, d_model]
+    lm_head = state_dict["lm_head.weight"]  # [vocab_size, d_model]
+    
+    return token_emb, lm_head
+
+
+def fft_embeddings(
+    token_emb: torch.Tensor,
+    lm_head: torch.Tensor,
+    verbose: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply FFT transformation to embedding tables for complex model initialization.
+    
+    FFT is applied along the d_model dimension, transforming each token's
+    embedding from spatial to complex spectral representation.
+    
+    Args:
+        token_emb: Token embeddings [vocab_size, d_model]
+        lm_head: Output projection weights [vocab_size, d_model]
+        verbose: Whether to print diagnostics
+        
+    Returns:
+        Tuple of (fft_token_emb, fft_lm_head) as complex tensors
+    """
+    if verbose:
+        print("\nApplying FFT transformation to embeddings...")
+        print(f"  Token embeddings shape: {token_emb.shape}")
+        print(f"  LM head shape: {lm_head.shape}")
+    
+    # Apply FFT along the d_model dimension
+    fft_token_emb = fft_transform_tensor(token_emb, dim=-1)
+    fft_lm_head = fft_transform_tensor(lm_head, dim=-1)
+    
+    if verbose:
+        # Compute energy distribution (using magnitude squared)
+        token_energy = (fft_token_emb.abs() ** 2).sum(dim=0)
+        total_energy = token_energy.sum().item()
+        d_model = token_emb.shape[-1]
+        
+        # Energy in first 25%, 50%, 75%, 100%
+        for pct in [0.25, 0.50, 0.75, 1.0]:
+            cutoff = int(d_model * pct)
+            band_energy = token_energy[:cutoff].sum().item()
+            print(f"  Token emb energy in first {int(pct*100)}%: {band_energy/total_energy:.3f}")
+        
+        # Check that FFT is invertible (round-trip check)
+        reconstructed = ifft_transform_tensor(fft_token_emb, dim=-1)
+        error = (reconstructed - token_emb).abs().max().item()
+        print(f"  FFT reconstruction error (should be ~0): {error:.2e}")
+    
+    return fft_token_emb, fft_lm_head
+
+
+def initialize_complex_esmt_from_nanogpt(
+    complex_esmt: Any,
+    nanogpt_checkpoint: str,
+    verbose: bool = True,
+) -> Any:
+    """
+    Initialize a ComplexSpectralGPT model's embeddings from a pretrained NanoGPT.
+    
+    This extracts the embedding tables from NanoGPT, applies FFT transformation,
+    and loads them into the complex model. The transformer layers are NOT transferred.
+    
+    Note: ComplexSpectralGPT uses phase-based positional encoding (shift theorem),
+    so we don't transfer positional embeddings. Only token embeddings are transferred.
+    
+    For the output projection, we need to handle the fact that ComplexToLogits
+    projects from magnitude+phase (2*d_model) to vocab_size, while NanoGPT
+    projects from d_model to vocab_size. We initialize the magnitude part
+    from the FFT'd lm_head and the phase part to small values.
+    
+    Args:
+        complex_esmt: The ComplexSpectralGPT model to initialize
+        nanogpt_checkpoint: Path to pretrained NanoGPT checkpoint
+        verbose: Print diagnostic information
+        
+    Returns:
+        The ComplexSpectralGPT model with initialized embeddings
+    """
+    if verbose:
+        print(f"\nInitializing ComplexSpectralGPT from NanoGPT: {nanogpt_checkpoint}")
+    
+    # Extract embeddings from NanoGPT
+    token_emb, lm_head = extract_embeddings_from_nanogpt_for_complex(nanogpt_checkpoint)
+    
+    # Verify dimensions match
+    d_model = complex_esmt.config.d_model
+    vocab_size = complex_esmt.config.vocab_size
+    
+    assert token_emb.shape == (vocab_size, d_model), \
+        f"Token emb shape mismatch: {token_emb.shape} vs ({vocab_size}, {d_model})"
+    assert lm_head.shape == (vocab_size, d_model), \
+        f"LM head shape mismatch: {lm_head.shape} vs ({vocab_size}, {d_model})"
+    
+    # Apply FFT to get complex embeddings
+    fft_token, fft_lm_head = fft_embeddings(token_emb, lm_head, verbose=verbose)
+    
+    # Load into ComplexSpectralGPT model
+    with torch.no_grad():
+        # Token embeddings: directly set complex embedding
+        complex_esmt.token_emb.embedding.data.copy_(fft_token)
+        
+        # Output projection (ComplexToLogits): [vocab_size, 2*d_model]
+        # First d_model columns correspond to magnitude
+        # Second d_model columns correspond to phase
+        # 
+        # We initialize magnitude projection from FFT'd lm_head (taking real part as approximation)
+        # and phase projection to small random values
+        lm_head_proj = complex_esmt.lm_head.proj.weight  # [vocab_size, 2*d_model]
+        
+        # For the magnitude part, use the magnitude of FFT'd embeddings
+        # This is a heuristic - the exact initialization isn't critical
+        # since the model will learn to use it
+        mag_weights = fft_lm_head.abs()  # [vocab_size, d_model]
+        
+        # For the phase part, initialize to small values
+        # (phase information will need to be learned)
+        phase_weights = torch.randn(vocab_size, d_model) * 0.01
+        
+        # Concatenate and assign
+        lm_head_proj[:, :d_model] = mag_weights
+        lm_head_proj[:, d_model:] = phase_weights
+    
+    if verbose:
+        print(f"\n  Successfully initialized ComplexSpectralGPT embeddings")
+        print(f"  Token embeddings: FFT applied, now complex-valued")
+        print(f"  Positional encoding: Using shift theorem (not transferred)")
+        print(f"  Output projection: Magnitude from FFT, phase initialized randomly")
+    
+    return complex_esmt
+
+
+def freeze_complex_embeddings(
+    model: Any, 
+    freeze_token: bool = True, 
+    freeze_lm_head: bool = True
+) -> None:
+    """
+    Freeze embedding layers in a ComplexSpectralGPT model.
+    
+    Note: Positional encoding in ComplexSpectralGPT is not learned
+    (it's the fixed phase ramp from shift theorem), so nothing to freeze there.
+    
+    Args:
+        model: The ComplexSpectralGPT model
+        freeze_token: Freeze token embeddings
+        freeze_lm_head: Freeze output projection
+    """
+    if freeze_token:
+        model.token_emb.embedding.requires_grad = False
+        
+    if freeze_lm_head:
+        model.lm_head.proj.weight.requires_grad = False
+
+
+def unfreeze_complex_embeddings(model: Any) -> None:
+    """
+    Unfreeze all learnable embeddings in a ComplexSpectralGPT model.
+    
+    Args:
+        model: The ComplexSpectralGPT model
+    """
+    model.token_emb.embedding.requires_grad = True
+    model.lm_head.proj.weight.requires_grad = True
+
+
+def analyze_complex_embedding_spectrum(
+    model: Any, 
+    title: str = "Complex Embedding Spectrum Analysis"
+) -> dict:
+    """
+    Analyze the spectral properties of a ComplexSpectralGPT's embeddings.
+    
+    Args:
+        model: The ComplexSpectralGPT model
+        title: Title for the analysis
+        
+    Returns:
+        Dict with spectral statistics
+    """
+    print(f"\n{title}")
+    print("=" * 60)
+    
+    results = {}
+    
+    # Token embeddings (complex)
+    token_emb = model.token_emb.embedding.data.detach()
+    token_mag = token_emb.abs()
+    token_phase = token_emb.angle()
+    
+    # Energy distribution (magnitude squared)
+    energy = (token_mag ** 2).sum(dim=0)  # [d_model]
+    total_energy = energy.sum().item()
+    d_model = token_emb.shape[-1]
+    
+    energy_dist = {}
+    for pct in [0.25, 0.50, 0.75, 1.0]:
+        cutoff = int(d_model * pct)
+        band_energy = energy[:cutoff].sum().item()
+        energy_dist[f"energy_0_to_{int(pct*100)}pct"] = band_energy / total_energy if total_energy > 0 else 0.0
+    
+    results["token_emb_energy"] = energy_dist
+    print(f"Token embeddings energy distribution: {energy_dist}")
+    
+    # Phase statistics
+    phase_mean = token_phase.mean().item()
+    phase_std = token_phase.std().item()
+    results["token_emb_phase"] = {"mean": phase_mean, "std": phase_std}
+    print(f"Token embeddings phase: mean={phase_mean:.3f}, std={phase_std:.3f}")
+    
+    # Magnitude statistics
+    mag_mean = token_mag.mean().item()
+    mag_std = token_mag.std().item()
+    results["token_emb_magnitude"] = {"mean": mag_mean, "std": mag_std}
+    print(f"Token embeddings magnitude: mean={mag_mean:.3f}, std={mag_std:.3f}")
+    
+    return results
+
+
 def analyze_embedding_spectrum(model: Any, title: str = "Embedding Spectrum Analysis") -> dict:
     """
     Analyze the spectral properties of a model's embeddings.

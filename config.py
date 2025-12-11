@@ -1,6 +1,7 @@
 """Configuration dataclasses for ESMT and training."""
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass
@@ -76,6 +77,84 @@ class ESMTConfig:
             freeze_str = ",frozen" if self.freeze_embeddings else ""
             features.append(f"SpectralInit({'+'.join(dct_parts)}{freeze_str})")
         return ", ".join(features) if features else "Baseline (no experiments)"
+
+
+@dataclass
+class ComplexESMTConfig:
+    """Configuration for the Complex Spectral Transformer.
+    
+    This config is for the complex-valued variant of ESMT that uses:
+    - Complex embeddings and positional encoding (shift theorem)
+    - Complex attention with magnitude-based or phase-aware softmax
+    - Complex FFN with ModReLU activation
+    - Multiplicative or additive residual connections
+    """
+    
+    # Model dimensions
+    d_model: int = 64  # Hidden dimension (must be even for complex pairs)
+    n_layers: int = 6  # Number of transformer blocks
+    n_heads: int = 8   # Number of attention heads
+    vocab_size: int = 50257  # GPT-2 tokenizer vocabulary size
+    seq_len: int = 512  # Maximum sequence length
+    mlp_ratio: int = 4  # MLP expansion ratio
+    dropout: float = 0.0  # Dropout rate
+    eps: float = 1e-6  # LayerNorm epsilon
+    
+    # ===========================================================================
+    # Complex-Specific Options
+    # ===========================================================================
+    
+    # Attention mode:
+    # - "magnitude": Attention weights = |Q @ K†| / sqrt(d)
+    # - "phase_aware": Attention weights = |Q @ K†| * cos(angle(Q @ K†)) / sqrt(d)
+    attention_mode: Literal["magnitude", "phase_aware"] = "magnitude"
+    
+    # LayerNorm mode:
+    # - "magnitude": Normalize magnitude only, preserve relative phases
+    # - "split": Normalize real and imaginary parts separately (Trabelsi et al.)
+    layernorm_mode: Literal["magnitude", "split"] = "magnitude"
+    
+    # Residual connection mode:
+    # - "multiplicative": x * (1 + f(x)) - more natural for complex numbers
+    # - "additive": x + f(x) - standard transformer residual
+    residual_mode: Literal["multiplicative", "additive"] = "multiplicative"
+    
+    # Positional encoding base frequency (higher = slower rotation for low dims)
+    pos_encoding_base: float = 10000.0
+    
+    # Maximum sequence length for positional encoding (can be > seq_len for OOD testing)
+    max_pos_len: int = 8192
+    
+    # ===========================================================================
+    # Initialization from Pretrained NanoGPT
+    # ===========================================================================
+    
+    # Path to pretrained NanoGPT checkpoint for FFT initialization
+    # If set, embeddings are initialized by applying FFT to NanoGPT embeddings
+    fft_init_checkpoint: str | None = None
+    
+    # Whether to freeze FFT'd embeddings during training
+    freeze_embeddings: bool = False
+    
+    def __post_init__(self):
+        assert self.d_model % 2 == 0, "d_model must be even for complex pairs"
+        assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
+    
+    @property
+    def head_dim(self) -> int:
+        return self.d_model // self.n_heads
+    
+    def experiment_summary(self) -> str:
+        """Return a summary of configuration choices."""
+        parts = [
+            f"attn={self.attention_mode}",
+            f"ln={self.layernorm_mode}",
+            f"res={self.residual_mode}",
+        ]
+        if self.fft_init_checkpoint:
+            freeze_str = ",frozen" if self.freeze_embeddings else ""
+            parts.append(f"FFT_init{freeze_str}")
+        return f"ComplexESMT({', '.join(parts)})"
 
 
 @dataclass
