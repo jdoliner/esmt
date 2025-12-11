@@ -201,7 +201,7 @@ class TrainConfig:
     full_bandwidth_prob: float = 0.5  # Probability of training at full bandwidth
 
     # Evaluation
-    eval_interval: int = 500  # Evaluate every N steps
+    eval_interval: int = 2000                         # Evaluate every N steps
     eval_bandwidths: tuple = (0.25, 0.50, 0.75, 1.0)  # Bandwidth ratios for spectral sweep
 
     # Reproducibility
