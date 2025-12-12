@@ -237,7 +237,7 @@ class ModReLU(nn.Module):
     only signals with sufficient magnitude pass through.
     """
     
-    def __init__(self, features: int, bias_init: float = -0.1):
+    def __init__(self, features: int, bias_init: float = 0.5):
         super().__init__()
         # Learnable bias per feature (applied to magnitude)
         self.bias = nn.Parameter(torch.full((features,), bias_init))
