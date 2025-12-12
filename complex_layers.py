@@ -29,6 +29,148 @@ import torch.nn.functional as F
 # ==============================================================================
 
 
+def complex_unitary_init(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Initialize complex tensor as a unitary (square) or isometric (rectangular) matrix.
+    
+    Unitary/isometric matrices preserve norms under multiplication, which prevents
+    gradient vanishing/exploding in deep complex networks.
+    
+    For square matrices (d_in == d_out): Returns a unitary matrix Q where Q†Q = I
+    For rectangular matrices: Returns an isometric matrix with orthonormal rows/columns
+    
+    Implementation uses QR decomposition of a random complex Gaussian matrix.
+    
+    Args:
+        tensor: Complex tensor to initialize in-place, shape (out_features, in_features)
+    
+    Returns:
+        The initialized tensor
+    """
+    if tensor.dim() < 2:
+        # For 1D tensors, fall back to unit magnitude with random phase
+        with torch.no_grad():
+            phase = torch.rand(tensor.shape, device=tensor.device, dtype=torch.float32) * 2 * math.pi - math.pi
+            tensor.copy_(torch.polar(torch.ones_like(phase), phase).to(tensor.dtype))
+        return tensor
+    
+    out_features, in_features = tensor.shape
+    
+    with torch.no_grad():
+        # Generate random complex Gaussian matrix
+        # Use the larger dimension to ensure we get enough orthonormal vectors
+        max_dim = max(out_features, in_features)
+        
+        real_part = torch.randn(max_dim, max_dim, device=tensor.device, dtype=torch.float32)
+        imag_part = torch.randn(max_dim, max_dim, device=tensor.device, dtype=torch.float32)
+        random_matrix = torch.complex(real_part, imag_part)
+        
+        # QR decomposition gives us orthonormal columns in Q
+        Q, R = torch.linalg.qr(random_matrix)
+        
+        # Make the result deterministic by fixing the sign/phase ambiguity
+        # Multiply each column by the phase of the diagonal of R
+        # This ensures Q is uniquely determined
+        diag_R = torch.diag(R)
+        phase_correction = diag_R / diag_R.abs().clamp(min=1e-10)
+        Q = Q * phase_correction.unsqueeze(0)
+        
+        # Extract the portion we need
+        # Q has shape (max_dim, max_dim), we need (out_features, in_features)
+        Q_slice = Q[:out_features, :in_features]
+        
+        tensor.copy_(Q_slice.to(tensor.dtype))
+    
+    return tensor
+
+
+def complex_small_init(tensor: torch.Tensor, scale: float = 0.01) -> torch.Tensor:
+    """
+    Initialize complex tensor with small magnitude complex normal values.
+    
+    Used for residual exit layers (output projections) to ensure the block
+    starts as approximately identity: y = x + epsilon
+    
+    Args:
+        tensor: Complex tensor to initialize in-place
+        scale: Standard deviation for real and imaginary parts
+    
+    Returns:
+        The initialized tensor
+    """
+    with torch.no_grad():
+        real_part = torch.randn(tensor.shape, device=tensor.device, dtype=torch.float32) * scale
+        imag_part = torch.randn(tensor.shape, device=tensor.device, dtype=torch.float32) * scale
+        tensor.copy_(torch.complex(real_part, imag_part))
+    
+    return tensor
+
+
+def complex_pink_noise_init(tensor: torch.Tensor, decay_exponent: float = 0.5) -> torch.Tensor:
+    """
+    Initialize complex tensor with "pink noise" spectral profile.
+    
+    The magnitude decays with frequency index to match the Matryoshka prior:
+    - Low-frequency components (early indices) have larger magnitude
+    - High-frequency components (later indices) have smaller magnitude
+    
+    Formula:
+        Phase: θ ~ Uniform[-π, π]
+        Magnitude: |z_k| ~ Rayleigh(σ_k) where σ_k = C / (k+1)^decay_exponent
+        Result: weight[k] = |z_k| * e^{iθ}
+    
+    The constant C is chosen so that average variance ≈ 1.
+    
+    Args:
+        tensor: Complex tensor to initialize in-place, shape (num_tokens, d_model)
+        decay_exponent: Controls how fast magnitude decays (default 0.5 = pink noise)
+    
+    Returns:
+        The initialized tensor
+    """
+    if tensor.dim() < 2:
+        # For 1D tensors, use simple complex normal
+        with torch.no_grad():
+            real_part = torch.randn(tensor.shape, device=tensor.device, dtype=torch.float32) * 0.02
+            imag_part = torch.randn(tensor.shape, device=tensor.device, dtype=torch.float32) * 0.02
+            tensor.copy_(torch.complex(real_part, imag_part))
+        return tensor
+    
+    num_tokens, d_model = tensor.shape
+    
+    with torch.no_grad():
+        # Compute frequency-dependent scale factors
+        # σ_k = C / (k+1)^decay_exponent
+        k = torch.arange(d_model, device=tensor.device, dtype=torch.float32)
+        sigma_k = 1.0 / (k + 1).pow(decay_exponent)  # Shape: [d_model]
+        
+        # Normalize so that average variance ≈ 1
+        # For Rayleigh(σ), E[|z|²] = 2σ²
+        # Total expected variance = Σ_k 2σ_k² / d_model should equal 1
+        # So we need C² * Σ_k 2/(k+1)^(2*decay_exponent) / d_model = 1
+        sum_sigma_sq = (sigma_k ** 2).sum()
+        C = math.sqrt(d_model / (2.0 * sum_sigma_sq.item()))
+        sigma_k = sigma_k * C  # Shape: [d_model]
+        
+        # Generate Rayleigh-distributed magnitudes
+        # Rayleigh(σ) can be generated as σ * sqrt(-2 * log(U)) where U ~ Uniform(0,1)
+        # Or equivalently: σ * sqrt(X² + Y²) where X,Y ~ Normal(0,1)
+        # We use the latter for numerical stability
+        X = torch.randn(num_tokens, d_model, device=tensor.device, dtype=torch.float32)
+        Y = torch.randn(num_tokens, d_model, device=tensor.device, dtype=torch.float32)
+        magnitude = sigma_k.unsqueeze(0) * torch.sqrt(X**2 + Y**2)  # Shape: [num_tokens, d_model]
+        
+        # Generate uniform random phase
+        phase = torch.rand(num_tokens, d_model, device=tensor.device, dtype=torch.float32) * 2 * math.pi - math.pi
+        
+        # Construct complex tensor
+        tensor.copy_(torch.polar(magnitude, phase).to(tensor.dtype))
+    
+    return tensor
+
+
+# Legacy initialization functions (kept for compatibility but not used by default)
+
 def complex_kaiming_init(tensor: torch.Tensor, mode: str = "fan_in") -> torch.Tensor:
     """
     Initialize complex tensor using Rayleigh distribution for magnitude
@@ -128,6 +270,10 @@ class ComplexLinear(nn.Module):
     
     This is mathematically equivalent to PyTorch's native complex matmul
     but gives us more control over the implementation.
+    
+    Initialization:
+        - Default: Unitary/isometric initialization (preserves norms, prevents gradient collapse)
+        - residual_exit=True: Small-scale initialization for output projections in residual blocks
     """
     
     def __init__(
@@ -135,11 +281,14 @@ class ComplexLinear(nn.Module):
         in_features: int, 
         out_features: int, 
         bias: bool = True,
-        init: Literal["kaiming", "xavier", "uniform_phase"] = "kaiming"
+        residual_exit: bool = False,
+        residual_exit_scale: float = 1e-5
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.residual_exit = residual_exit
+        self.residual_exit_scale = residual_exit_scale
         
         # Complex weight matrix
         self.weight = nn.Parameter(
@@ -154,20 +303,20 @@ class ComplexLinear(nn.Module):
             self.register_parameter("bias", None)
         
         # Initialize
-        self._init_weights(init)
+        self._init_weights()
     
-    def _init_weights(self, init: str) -> None:
-        if init == "kaiming":
-            complex_kaiming_init(self.weight)
-        elif init == "xavier":
-            complex_xavier_init(self.weight)
-        elif init == "uniform_phase":
-            complex_uniform_phase_init(self.weight, magnitude=0.02)
+    def _init_weights(self) -> None:
+        if self.residual_exit:
+            # Near-zero initialization for residual exit layers
+            # Ensures block starts as approximately identity: y = x + epsilon
+            complex_small_init(self.weight, scale=self.residual_exit_scale)
         else:
-            raise ValueError(f"Unknown init: {init}")
+            # Unitary/isometric initialization for all other layers
+            # Preserves norms and prevents gradient vanishing/exploding
+            complex_unitary_init(self.weight)
         
         if self.bias is not None:
-            # Initialize bias to zero
+            # Initialize bias to zero (especially important for residual exits)
             self.bias.data.zero_()
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -382,33 +531,37 @@ class ComplexLayerNorm(nn.Module):
 
 class ComplexEmbedding(nn.Module):
     """
-    Complex-valued embedding layer.
+    Complex-valued embedding layer with pink noise initialization.
     
     Each token maps to a complex vector where both real and imaginary
     parts are learned. This gives the model 2x the representational
     capacity per dimension.
+    
+    Initialization uses "pink noise" spectral profile:
+    - Magnitude decays with frequency index: σ_k = C / √(k+1)
+    - Phase is uniform random in [-π, π]
+    
+    This matches the Matryoshka prior (low frequencies are more important)
+    and helps prevent isotropy collapse in high dimensions.
     """
     
-    def __init__(self, vocab_size: int, d_model: int):
+    def __init__(self, vocab_size: int, d_model: int, decay_exponent: float = 0.5):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
+        self.decay_exponent = decay_exponent
         
         # Learned complex embeddings
         self.embedding = nn.Parameter(
             torch.zeros(vocab_size, d_model, dtype=torch.complex64)
         )
         
-        # Initialize with small magnitude, random phase
+        # Initialize with pink noise spectral profile
         self._init_embeddings()
     
     def _init_embeddings(self) -> None:
-        """Initialize embeddings with Gaussian real/imag parts."""
-        # Standard deviation matching GPT-2 style init
-        std = 0.02
-        real_part = torch.randn(self.vocab_size, self.d_model) * std
-        imag_part = torch.randn(self.vocab_size, self.d_model) * std
-        self.embedding.data = torch.complex(real_part, imag_part)
+        """Initialize embeddings with pink noise spectral profile."""
+        complex_pink_noise_init(self.embedding, decay_exponent=self.decay_exponent)
     
     def forward(self, x: torch.Tensor, bandwidth_ratio: float = 1.0) -> torch.Tensor:
         """
@@ -539,6 +692,10 @@ class ComplexAttention(nn.Module):
        - This could help capture syntactic relationships
     
     The values are complex, so the output is a weighted sum of complex vectors.
+    
+    Initialization:
+        - QKV projection: Unitary/isometric (preserves norms)
+        - Output projection: Near-zero (residual exit for gradient flow)
     """
     
     def __init__(
@@ -547,7 +704,8 @@ class ComplexAttention(nn.Module):
         n_heads: int,
         seq_len: int,
         attention_mode: Literal["magnitude", "phase_aware"] = "magnitude",
-        dropout: float = 0.0
+        dropout: float = 0.0,
+        residual_exit_scale: float = 1e-5
     ):
         super().__init__()
         self.d_model = d_model
@@ -557,11 +715,14 @@ class ComplexAttention(nn.Module):
         
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         
-        # QKV projection (complex)
+        # QKV projection (complex) - uses unitary/isometric init
         self.qkv = ComplexLinear(d_model, 3 * d_model, bias=False)
         
-        # Output projection (complex)
-        self.proj = ComplexLinear(d_model, d_model, bias=False)
+        # Output projection (complex) - uses near-zero init for residual exit
+        self.proj = ComplexLinear(
+            d_model, d_model, bias=False, 
+            residual_exit=True, residual_exit_scale=residual_exit_scale
+        )
         
         # Causal mask
         self.register_buffer(
@@ -696,16 +857,25 @@ class ComplexFFN(nn.Module):
     
     The ModReLU preserves phase while applying a threshold to magnitude,
     acting as a learned noise gate.
+    
+    Initialization:
+        - Up projection (fc1): Unitary/isometric (preserves norms)
+        - Down projection (fc2): Near-zero (residual exit for gradient flow)
     """
     
-    def __init__(self, d_model: int, mlp_ratio: int = 4):
+    def __init__(self, d_model: int, mlp_ratio: int = 4, residual_exit_scale: float = 1e-5):
         super().__init__()
         self.d_model = d_model
         self.hidden_dim = d_model * mlp_ratio
         
+        # Up projection - uses unitary/isometric init
         self.fc1 = ComplexLinear(d_model, self.hidden_dim)
         self.act = ModReLU(self.hidden_dim)
-        self.fc2 = ComplexLinear(self.hidden_dim, d_model)
+        # Down projection - uses near-zero init for residual exit
+        self.fc2 = ComplexLinear(
+            self.hidden_dim, d_model,
+            residual_exit=True, residual_exit_scale=residual_exit_scale
+        )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -751,6 +921,11 @@ class ComplexSpectralBlock(nn.Module):
     The residual_mode flag allows switching between:
     - "multiplicative": x * (1 + f(x))
     - "additive": x + f(x) (standard transformer residual)
+    
+    Initialization strategy:
+    - Output projections (attn.proj, ffn.fc2) use near-zero init
+    - This ensures the block starts as approximately identity
+    - Gradients flow freely through the skip connection
     """
     
     def __init__(
@@ -763,7 +938,8 @@ class ComplexSpectralBlock(nn.Module):
         layernorm_mode: Literal["magnitude", "split"] = "magnitude",
         residual_mode: Literal["multiplicative", "additive"] = "multiplicative",
         eps: float = 1e-6,
-        dropout: float = 0.0
+        dropout: float = 0.0,
+        residual_exit_scale: float = 1e-5
     ):
         super().__init__()
         self.residual_mode = residual_mode
@@ -772,17 +948,22 @@ class ComplexSpectralBlock(nn.Module):
         self.ln1 = ComplexLayerNorm(d_model, eps=eps, mode=layernorm_mode)
         self.ln2 = ComplexLayerNorm(d_model, eps=eps, mode=layernorm_mode)
         
-        # Attention
+        # Attention (with near-zero output projection)
         self.attn = ComplexAttention(
             d_model=d_model,
             n_heads=n_heads,
             seq_len=seq_len,
             attention_mode=attention_mode,
-            dropout=dropout
+            dropout=dropout,
+            residual_exit_scale=residual_exit_scale
         )
         
-        # FFN
-        self.ffn = ComplexFFN(d_model=d_model, mlp_ratio=mlp_ratio)
+        # FFN (with near-zero down projection)
+        self.ffn = ComplexFFN(
+            d_model=d_model, 
+            mlp_ratio=mlp_ratio,
+            residual_exit_scale=residual_exit_scale
+        )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -835,20 +1016,60 @@ class ComplexToLogits(nn.Module):
     
     This preserves the phase information (potentially syntactic) while
     converting to the real domain needed for cross-entropy loss.
+    
+    Initialization uses pink noise spectral profile for the projection weights,
+    matching the Matryoshka prior and preventing large error signals on
+    high-frequency components from washing out the learned structure.
     """
     
-    def __init__(self, d_model: int, vocab_size: int):
+    def __init__(self, d_model: int, vocab_size: int, decay_exponent: float = 0.5):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
+        self.decay_exponent = decay_exponent
         
         # Project concatenated magnitude+phase to vocab
         # Input: 2*d_model (magnitude + phase)
         # Output: vocab_size
         self.proj = nn.Linear(2 * d_model, vocab_size, bias=False)
         
-        # Initialize
-        nn.init.normal_(self.proj.weight, mean=0.0, std=0.02)
+        # Initialize with pink noise profile
+        self._init_weights()
+    
+    def _init_weights(self) -> None:
+        """Initialize projection weights with pink noise spectral profile.
+        
+        The projection weight has shape [vocab_size, 2*d_model].
+        We apply pink noise decay along the input dimension (2*d_model),
+        which corresponds to the frequency axis of the complex representation.
+        
+        The first d_model columns correspond to magnitude features,
+        the second d_model columns correspond to phase features.
+        We apply the same decay pattern to both halves.
+        """
+        vocab_size = self.proj.weight.shape[0]
+        input_dim = self.proj.weight.shape[1]  # 2 * d_model
+        
+        with torch.no_grad():
+            # Create frequency-dependent scale factors for each half
+            # k indexes frequency within each half (magnitude part and phase part)
+            k = torch.arange(self.d_model, dtype=torch.float32)
+            sigma_k = 1.0 / (k + 1).pow(self.decay_exponent)
+            
+            # Normalize so variance ≈ 1
+            sum_sigma_sq = (sigma_k ** 2).sum()
+            C = math.sqrt(self.d_model / sum_sigma_sq.item())
+            sigma_k = sigma_k * C
+            
+            # Tile for both magnitude and phase parts
+            # Shape: [2*d_model]
+            sigma_full = torch.cat([sigma_k, sigma_k])
+            
+            # Initialize weights with scaled Gaussian
+            # Each row (output neuron) gets the same frequency-dependent scaling
+            weights = torch.randn(vocab_size, input_dim) * sigma_full.unsqueeze(0)
+            
+            self.proj.weight.copy_(weights)
     
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """
