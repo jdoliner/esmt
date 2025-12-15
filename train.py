@@ -863,9 +863,10 @@ def train_sat(
                     logger.log_scalar("sat/spectral_late_pos_mag", late_mag, global_step)
 
                 # Detect instability early and log detailed diagnostics
+                last_loss = loss_val
                 loss_val = loss.item()
                 is_unstable = loss_val > 100 or torch.isnan(loss) or torch.isinf(loss)
-                is_warning = loss_val > 10 or grad_norms.get("total_grad_norm", 0) > 10
+                is_warning = loss_val > 10 or grad_norms.get("total_grad_norm", 0) > 10 or loss_val - last_loss > 0.3
 
                 if is_unstable or is_warning:
                     print(
