@@ -167,13 +167,18 @@ def mod_relu(z: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
         Complex tensor (..., 2)
     """
     mag = complex_abs(z)  # (...)
-    phase = complex_phase(z)  # (...)
 
     # Apply ReLU to (magnitude - bias)
     new_mag = F.relu(mag - bias)  # (...)
 
-    # Reconstruct with new magnitude and original phase
-    return complex_from_polar(new_mag, phase)
+    # Instead of computing phase and using cos/sin (unstable for small mag),
+    # we directly scale the original complex number: z * (new_mag / mag)
+    # This avoids the phase computation entirely.
+    # Add eps to avoid division by zero
+    scale = new_mag / (mag + 1e-8)
+
+    # Scale both real and imaginary parts
+    return z * scale.unsqueeze(-1)
 
 
 def real_to_complex(x: torch.Tensor) -> torch.Tensor:
@@ -219,6 +224,69 @@ def complex_pair_to_complex(z: torch.Tensor) -> torch.Tensor:
 
 
 # ==============================================================================
+# Initialization Utilities for BF16 Complex Numbers
+# ==============================================================================
+
+
+def bf16_complex_unitary_init(weight: torch.Tensor) -> None:
+    """
+    Initialize complex weight tensor (*, 2) with unitary/isometric matrix.
+
+    Uses QR decomposition to create norm-preserving weight matrices.
+    This prevents gradient vanishing/exploding in deep networks.
+
+    Based on complex_unitary_init from complex_layers.py but adapted for
+    bfloat16 pair representation.
+
+    Args:
+        weight: Tensor of shape (out_features, in_features, 2)
+    """
+    out_features, in_features = weight.shape[0], weight.shape[1]
+    max_dim = max(out_features, in_features)
+
+    with torch.no_grad():
+        # Generate random complex Gaussian matrix in float32
+        real_part = torch.randn(max_dim, max_dim, dtype=torch.float32)
+        imag_part = torch.randn(max_dim, max_dim, dtype=torch.float32)
+        random_matrix = torch.complex(real_part, imag_part)
+
+        # QR decomposition gives orthonormal columns
+        Q, R = torch.linalg.qr(random_matrix)
+
+        # Fix phase ambiguity
+        diag_R = torch.diag(R)
+        phase_correction = diag_R / diag_R.abs().clamp(min=1e-10)
+        Q = Q * phase_correction.unsqueeze(0)
+
+        # Extract the portion we need
+        Q_slice = Q[:out_features, :in_features]
+
+        # Convert to bfloat16 pairs
+        weight[..., 0].copy_(Q_slice.real.to(torch.bfloat16))
+        weight[..., 1].copy_(Q_slice.imag.to(torch.bfloat16))
+
+
+def bf16_complex_small_init(weight: torch.Tensor, scale: float = 1e-5) -> None:
+    """
+    Initialize complex weight tensor with small magnitude values.
+
+    Used for residual exit layers (output projections) to ensure the block
+    starts as approximately identity: y = x + epsilon
+
+    Based on complex_small_init from complex_layers.py.
+
+    Args:
+        weight: Tensor of shape (*, 2)
+        scale: Standard deviation for real and imaginary parts
+    """
+    with torch.no_grad():
+        real_part = torch.randn(weight.shape[:-1], dtype=torch.float32) * scale
+        imag_part = torch.randn(weight.shape[:-1], dtype=torch.float32) * scale
+        weight[..., 0].copy_(real_part.to(torch.bfloat16))
+        weight[..., 1].copy_(imag_part.to(torch.bfloat16))
+
+
+# ==============================================================================
 # Complex Linear Operations
 # ==============================================================================
 
@@ -230,6 +298,10 @@ class ComplexLinearBF16(nn.Module):
     Computes: y = Wx + b where W, x, b are all complex (as bfloat16 pairs).
 
     The weight is stored as (out_features, in_features, 2) and bias as (out_features, 2).
+
+    Initialization (following best practices from complex_layers.py):
+        - Default: Unitary/isometric initialization (preserves norms)
+        - residual_exit=True: Near-zero initialization for output projections
     """
 
     def __init__(
@@ -237,11 +309,14 @@ class ComplexLinearBF16(nn.Module):
         in_features: int,
         out_features: int,
         bias: bool = True,
-        zero_init: bool = False,
+        residual_exit: bool = False,
+        residual_exit_scale: float = 1e-5,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.residual_exit = residual_exit
+        self.residual_exit_scale = residual_exit_scale
 
         # Weight: (out_features, in_features, 2) for complex
         self.weight = nn.Parameter(torch.zeros(out_features, in_features, 2, dtype=torch.bfloat16))
@@ -251,19 +326,17 @@ class ComplexLinearBF16(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        self._init_weights(zero_init)
+        self._init_weights()
 
-    def _init_weights(self, zero_init: bool) -> None:
-        if zero_init:
-            # Zero initialization for residual exits
-            nn.init.zeros_(self.weight)
+    def _init_weights(self) -> None:
+        if self.residual_exit:
+            # Near-zero initialization for residual exit layers
+            # Ensures block starts as approximately identity: y = x + epsilon
+            bf16_complex_small_init(self.weight, scale=self.residual_exit_scale)
         else:
-            # Kaiming-style initialization for complex
-            # Scale by 1/sqrt(2*fan_in) since we have real and imag parts
-            fan_in = self.in_features
-            std = 1.0 / math.sqrt(2.0 * fan_in)
-            nn.init.normal_(self.weight[..., 0], mean=0.0, std=std)
-            nn.init.normal_(self.weight[..., 1], mean=0.0, std=std)
+            # Unitary/isometric initialization
+            # Preserves norms and prevents gradient vanishing/exploding
+            bf16_complex_unitary_init(self.weight)
 
         if self.bias is not None:
             nn.init.zeros_(self.bias)
@@ -415,6 +488,9 @@ class SpectralConv1d(nn.Module):
     frequency domain. This corresponds to convolution in the spatial domain.
 
     Weight shape: (d_out, d_in, k_max, 2) for complex weights per frequency mode.
+
+    Initialization: Each frequency mode gets a separate unitary/isometric matrix
+    to preserve norms and prevent gradient issues.
     """
 
     def __init__(self, d_in: int, d_out: int, k_max: int):
@@ -429,11 +505,18 @@ class SpectralConv1d(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        # Initialize with small complex values
-        # Scale by 1/sqrt(d_in * k_max) for each output dimension
-        std = 1.0 / math.sqrt(self.d_in * self.k_max)
-        nn.init.normal_(self.weight[..., 0], mean=0.0, std=std)
-        nn.init.normal_(self.weight[..., 1], mean=0.0, std=std)
+        # Initialize each frequency mode with a unitary/isometric matrix
+        # This preserves norms and prevents gradient vanishing/exploding
+        with torch.no_grad():
+            for k in range(self.k_max):
+                # Get a (d_out, d_in) slice for this frequency
+                weight_k = self.weight[:, :, k, :]  # (d_out, d_in, 2)
+                bf16_complex_unitary_init(weight_k)
+
+            # Scale down slightly to prevent output explosion when summing across frequencies
+            # The unitary init preserves norm, but we're summing k_max contributions
+            scale = 1.0 / math.sqrt(self.k_max)
+            self.weight.mul_(scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -510,7 +593,9 @@ class FNOBlock(nn.Module):
         self.spectral_conv = SpectralConv1d(d_model, d_model, k_max)
 
         # ModReLU bias (one per feature dimension, shared across frequencies)
-        self.modrelu_bias = nn.Parameter(torch.full((d_model,), 0.5, dtype=torch.bfloat16))
+        # Initialize to 0 so all signals pass through initially.
+        # The model can learn to increase this to filter noise.
+        self.modrelu_bias = nn.Parameter(torch.zeros(d_model, dtype=torch.bfloat16))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -1033,6 +1118,10 @@ class SpectralAugmentedTransformer(nn.Module):
         # Initialize weights
         self.apply(self._init_weights)
 
+        # Re-apply custom initialization for components that need special init
+        # (the apply() above resets all Linear biases to 0, but bridge needs gamma=1)
+        self.adaln_bridge._init_weights()
+
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -1182,8 +1271,10 @@ class SpectralAugmentedTransformer(nn.Module):
         # Expand weights for broadcasting: (1, 1, 1, K, 1)
         weights = weights.view(1, 1, 1, -1, 1)
 
-        # Weighted MSE
-        diff_squared = (pred - target) ** 2  # (B, T-1, D_spec, K, 2)
+        # Weighted MSE - convert to float32 for numerical stability
+        pred_f = pred.float()
+        target_f = target.float()
+        diff_squared = (pred_f - target_f) ** 2  # (B, T-1, D_spec, K, 2)
         weighted_diff = diff_squared * weights
         loss = weighted_diff.mean()
 
