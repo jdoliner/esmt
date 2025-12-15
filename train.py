@@ -749,6 +749,7 @@ def train_sat(
             leave=True,
         )
 
+        loss_val = None
         for batch_idx, (x, y) in enumerate(progress_bar):
             x, y = x.to(device), y.to(device)
             batch_start_time = time.time()
@@ -866,7 +867,7 @@ def train_sat(
                 last_loss = loss_val
                 loss_val = loss.item()
                 is_unstable = loss_val > 100 or torch.isnan(loss) or torch.isinf(loss)
-                is_warning = loss_val > 10 or grad_norms.get("total_grad_norm", 0) > 10 or loss_val - last_loss > 0.3
+                is_warning = loss_val > 10 or grad_norms.get("total_grad_norm", 0) > 10 or (loss_val - last_loss > 0.3 if last_loss is not None else False)
 
                 if is_unstable or is_warning:
                     print(
