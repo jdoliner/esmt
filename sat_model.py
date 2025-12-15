@@ -181,6 +181,73 @@ def mod_relu(z: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     return z * scale.unsqueeze(-1)
 
 
+def mod_softplus(z: torch.Tensor, bias: torch.Tensor, beta: float = 1.0) -> torch.Tensor:
+    """
+    Soft version of ModReLU that doesn't have the "dead neuron" problem.
+
+    Uses softplus instead of ReLU on the magnitude, ensuring gradients always flow.
+    The bias acts as a "soft threshold" rather than hard cutoff.
+
+    ModSoftplus(z) = softplus(|z| - b) * (z / |z|)
+
+    For large |z|, this approximates ModReLU.
+    For small |z|, gradients still flow (no dead neurons).
+
+    Args:
+        z: Complex tensor (..., 2)
+        bias: Real tensor, soft threshold bias
+        beta: Softplus beta parameter (higher = sharper transition)
+
+    Returns:
+        Complex tensor (..., 2)
+    """
+    mag = complex_abs(z)  # (...)
+
+    # Apply softplus to (magnitude - bias)
+    # softplus(x) = (1/beta) * log(1 + exp(beta * x))
+    new_mag = F.softplus(mag - bias, beta=beta)  # (...)
+
+    # Scale original complex number by ratio
+    scale = new_mag / (mag + 1e-8)
+
+    return z * scale.unsqueeze(-1)
+
+
+def mod_elu(z: torch.Tensor, bias: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+    """
+    ELU-based complex activation that never completely kills gradients.
+
+    For |z| > bias: output magnitude = |z| - bias (like ModReLU)
+    For |z| < bias: output magnitude = alpha * (exp(|z| - bias) - 1) (small negative -> small positive)
+
+    This ensures gradients always flow, preventing dead neurons.
+
+    Args:
+        z: Complex tensor (..., 2)
+        bias: Real tensor, threshold bias
+        alpha: ELU alpha parameter
+
+    Returns:
+        Complex tensor (..., 2)
+    """
+    mag = complex_abs(z)  # (...)
+
+    # Apply ELU to (magnitude - bias), then shift to ensure positive output
+    # ELU: x if x > 0, else alpha * (exp(x) - 1)
+    diff = mag - bias
+    new_mag = torch.where(
+        diff > 0,
+        diff,
+        alpha * (torch.exp(diff.clamp(max=10)) - 1) + alpha,  # +alpha to keep positive
+    )
+    new_mag = new_mag.clamp(min=0)  # Ensure non-negative
+
+    # Scale original complex number
+    scale = new_mag / (mag + 1e-8)
+
+    return z * scale.unsqueeze(-1)
+
+
 def real_to_complex(x: torch.Tensor) -> torch.Tensor:
     """
     Convert real tensor to complex by adding zero imaginary part.
@@ -388,17 +455,23 @@ class CumulativeFFT(nn.Module):
     This gives us O(T * D * K) compute instead of O(T^2 * log(T)) for naive approach.
 
     The output is a complex tensor in bfloat16 pair format.
+
+    Normalization options:
+    - "ortho": Standard 1/sqrt(N) normalization (default)
+    - "position": Per-position normalization by 1/sqrt(t+1) to keep magnitudes stable
     """
 
-    def __init__(self, seq_len: int, k_max: int):
+    def __init__(self, seq_len: int, k_max: int, normalization: str = "position"):
         """
         Args:
             seq_len: Maximum sequence length (N for FFT)
             k_max: Number of frequency modes to keep
+            normalization: "ortho" for standard 1/sqrt(N), "position" for per-position 1/sqrt(t+1)
         """
         super().__init__()
         self.seq_len = seq_len
         self.k_max = k_max
+        self.normalization = normalization
 
         # Precompute twiddle factors: e^{-2*pi*i*k*n/N}
         # Shape: (seq_len, k_max, 2) for bfloat16 complex pairs
@@ -422,6 +495,12 @@ class CumulativeFFT(nn.Module):
             "norm_factor", torch.tensor(1.0 / math.sqrt(seq_len), dtype=torch.bfloat16)
         )
         self.norm_factor: torch.Tensor
+
+        # Per-position normalization factors: 1/sqrt(t+1) for t=0,1,...,seq_len-1
+        # This keeps the magnitude roughly constant regardless of position
+        pos_norm = 1.0 / torch.sqrt(torch.arange(1, seq_len + 1, dtype=torch.float32))
+        self.register_buffer("pos_norm", pos_norm.to(torch.bfloat16))
+        self.pos_norm: torch.Tensor
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -469,8 +548,16 @@ class CumulativeFFT(nn.Module):
         # At position t, we have sum of contributions from 0 to t
         cumulative_fft = torch.cumsum(contributions, dim=1)
 
-        # Apply ortho normalization
-        cumulative_fft = cumulative_fft * self.norm_factor
+        # Apply normalization
+        if self.normalization == "position":
+            # Per-position normalization: 1/sqrt(t+1)
+            # This keeps magnitude roughly constant regardless of position
+            # Shape: (1, seq_len, 1, 1, 1) for broadcasting
+            pos_norm = self.pos_norm[:seq_len].view(1, seq_len, 1, 1, 1)
+            cumulative_fft = cumulative_fft * pos_norm
+        else:
+            # Standard ortho normalization: 1/sqrt(N)
+            cumulative_fft = cumulative_fft * self.norm_factor
 
         return cumulative_fft
 
@@ -577,25 +664,50 @@ class FNOBlock(nn.Module):
     Fourier Neural Operator block.
 
     Architecture:
-        x -> SpectralConv -> + -> ModReLU -> out
+        x -> SpectralConv -> + -> Activation -> (optional gate) -> out
              |               ^
              +-- residual ---+
 
     The residual is in the frequency domain (simple addition).
+
+    Activation options:
+    - "modrelu": Hard threshold (can cause dead neurons)
+    - "modsoftplus": Soft threshold (gradients always flow)
+    - "modelu": ELU-based (gradients always flow)
+
+    Output gating (optional):
+    - Learnable scalar gate initialized to small value
+    - Prevents early explosion by keeping outputs small initially
     """
 
-    def __init__(self, d_model: int, k_max: int):
+    def __init__(
+        self,
+        d_model: int,
+        k_max: int,
+        activation: str = "modsoftplus",
+        use_output_gate: bool = True,
+        gate_init: float = 0.1,
+    ):
         super().__init__()
         self.d_model = d_model
         self.k_max = k_max
+        self.activation = activation
+        self.use_output_gate = use_output_gate
 
         # Spectral convolution (complex)
         self.spectral_conv = SpectralConv1d(d_model, d_model, k_max)
 
-        # ModReLU bias (one per feature dimension, shared across frequencies)
+        # Activation bias (one per feature dimension, shared across frequencies)
         # Initialize to 0 so all signals pass through initially.
         # The model can learn to increase this to filter noise.
         self.modrelu_bias = nn.Parameter(torch.zeros(d_model, dtype=torch.bfloat16))
+
+        # Output gate: learnable scalar that starts small
+        # This prevents the FNO from contributing too much early in training
+        if use_output_gate:
+            self.output_gate = nn.Parameter(torch.tensor(gate_init, dtype=torch.bfloat16))
+        else:
+            self.output_gate = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -611,11 +723,24 @@ class FNOBlock(nn.Module):
         # Residual connection (in frequency domain)
         out = out + x
 
-        # ModReLU activation
-        # Apply per-feature bias, broadcast across batch, seq, and frequency
+        # Apply activation
         # bias shape for broadcasting: (1, 1, d_model, 1)
         bias = self.modrelu_bias.view(1, 1, -1, 1)
-        out = mod_relu(out, bias)
+
+        if self.activation == "modrelu":
+            out = mod_relu(out, bias)
+        elif self.activation == "modsoftplus":
+            out = mod_softplus(out, bias, beta=2.0)
+        elif self.activation == "modelu":
+            out = mod_elu(out, bias)
+        else:
+            raise ValueError(f"Unknown activation: {self.activation}")
+
+        # Apply output gate if enabled
+        if self.output_gate is not None:
+            # Sigmoid to keep gate in (0, 1)
+            gate = torch.sigmoid(self.output_gate)
+            out = out * gate
 
         return out
 
@@ -1081,11 +1206,22 @@ class SpectralAugmentedTransformer(nn.Module):
         self.spectral_proj_in = nn.Linear(config.d_model, config.d_spectral)
 
         # Cumulative FFT
-        self.cumulative_fft = CumulativeFFT(config.seq_len, config.k_max)
+        self.cumulative_fft = CumulativeFFT(
+            config.seq_len, config.k_max, normalization=config.fft_normalization
+        )
 
         # FNO blocks
         self.fno_blocks = nn.ModuleList(
-            [FNOBlock(config.d_spectral, config.k_max) for _ in range(config.n_fno_layers)]
+            [
+                FNOBlock(
+                    config.d_spectral,
+                    config.k_max,
+                    activation=config.fno_activation,
+                    use_output_gate=config.fno_output_gate,
+                    gate_init=config.fno_gate_init,
+                )
+                for _ in range(config.n_fno_layers)
+            ]
         )
 
         # =====================================================================

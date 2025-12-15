@@ -132,6 +132,10 @@ def collect_gradient_norms(model: nn.Module) -> dict[str, float]:
     mlp_grads = []
     embedding_grads = []
     attention_grads = []
+    fno_grads = []  # SAT-specific
+    spectral_grads = []  # SAT-specific
+    bridge_grads = []  # SAT-specific
+    modrelu_grads = []  # SAT-specific
     other_grads = []
 
     for name, param in model.named_parameters():
@@ -146,6 +150,14 @@ def collect_gradient_norms(model: nn.Module) -> dict[str, float]:
 
         if "filter" in name:
             filter_grads.append(grad_norm)
+        elif "fno" in name or "spectral_conv" in name:
+            fno_grads.append(grad_norm)
+        elif "modrelu" in name:
+            modrelu_grads.append(grad_norm)
+        elif "bridge" in name:
+            bridge_grads.append(grad_norm)
+        elif "spectral" in name:
+            spectral_grads.append(grad_norm)
         elif "conv" in name:
             conv_grads.append(grad_norm)
         elif "mlp" in name or "fc1" in name or "fc2" in name or "ffn" in name:
@@ -168,6 +180,14 @@ def collect_gradient_norms(model: nn.Module) -> dict[str, float]:
         norms["embedding_grad_norm"] = sum(embedding_grads) / len(embedding_grads)
     if attention_grads:
         norms["attention_grad_norm"] = sum(attention_grads) / len(attention_grads)
+    if fno_grads:
+        norms["fno_grad_norm"] = sum(fno_grads) / len(fno_grads)
+    if modrelu_grads:
+        norms["modrelu_grad_norm"] = sum(modrelu_grads) / len(modrelu_grads)
+    if bridge_grads:
+        norms["bridge_grad_norm"] = sum(bridge_grads) / len(bridge_grads)
+    if spectral_grads:
+        norms["spectral_grad_norm"] = sum(spectral_grads) / len(spectral_grads)
     if other_grads:
         norms["other_grad_norm"] = sum(other_grads) / len(other_grads)
 
@@ -182,6 +202,63 @@ def collect_gradient_norms(model: nn.Module) -> dict[str, float]:
     norms["total_grad_norm"] = total_norm**0.5
 
     return norms
+
+
+def collect_sat_diagnostics(model: nn.Module) -> dict[str, float]:
+    """
+    Collect SAT-specific diagnostic statistics.
+
+    Tracks activations and weights in FNO blocks to diagnose instability.
+
+    Args:
+        model: SAT model
+
+    Returns:
+        Dict with SAT-specific metrics
+    """
+    stats = {}
+
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+
+    # Check if this is a SAT model
+    if not hasattr(model, "fno_blocks"):
+        return stats
+
+    # FNO block diagnostics
+    for i, fno_block in enumerate(model.fno_blocks):
+        prefix = f"fno_{i}"
+
+        # ModReLU bias statistics
+        if hasattr(fno_block, "modrelu_bias"):
+            bias = fno_block.modrelu_bias.data
+            stats[f"{prefix}_modrelu_bias_mean"] = bias.mean().item()
+            stats[f"{prefix}_modrelu_bias_min"] = bias.min().item()
+            stats[f"{prefix}_modrelu_bias_max"] = bias.max().item()
+            # Count "dead" biases (too high, blocking all signals)
+            stats[f"{prefix}_modrelu_bias_dead_frac"] = (bias > 0.5).float().mean().item()
+
+        # Spectral conv weight statistics
+        if hasattr(fno_block, "spectral_conv"):
+            weight = fno_block.spectral_conv.weight.data
+            # Weight is (d_out, d_in, k_max, 2) for bfloat16 complex
+            weight_mag = torch.sqrt(weight[..., 0] ** 2 + weight[..., 1] ** 2)
+            stats[f"{prefix}_conv_weight_mag_mean"] = weight_mag.mean().item()
+            stats[f"{prefix}_conv_weight_mag_max"] = weight_mag.max().item()
+
+    # Bridge diagnostics
+    if hasattr(model, "adaln_bridge"):
+        bridge = model.adaln_bridge
+        for i, proj in enumerate(bridge.layer_projs):
+            # Check if gamma bias drifted far from 1
+            if hasattr(proj, "bias") and proj.bias is not None:
+                d_model = proj.bias.shape[0] // 2
+                gamma_bias = proj.bias[:d_model]
+                beta_bias = proj.bias[d_model:]
+                stats[f"bridge_{i}_gamma_bias_mean"] = gamma_bias.mean().item()
+                stats[f"bridge_{i}_beta_bias_mean"] = beta_bias.mean().item()
+
+    return stats
 
 
 def collect_complex_diagnostics(model: nn.Module) -> dict[str, float]:
@@ -756,6 +833,41 @@ def train_sat(
                 # Log gradient norms
                 grad_norms = collect_gradient_norms(model)
                 logger.log_gradient_norms(grad_norms, global_step)
+
+                # Log SAT-specific diagnostics
+                sat_stats = collect_sat_diagnostics(model)
+                for key, value in sat_stats.items():
+                    logger.log_scalar(f"sat/{key}", value, global_step)
+
+                # Log spectral activation statistics (every 100 steps to reduce overhead)
+                if global_step % 100 == 0:
+                    # Log spectral magnitude statistics
+                    spectral_mag = torch.sqrt(
+                        spectral[..., 0].float() ** 2 + spectral[..., 1].float() ** 2
+                    )
+                    logger.log_scalar(
+                        "sat/spectral_mag_mean", spectral_mag.mean().item(), global_step
+                    )
+                    logger.log_scalar(
+                        "sat/spectral_mag_max", spectral_mag.max().item(), global_step
+                    )
+                    logger.log_scalar(
+                        "sat/spectral_mag_std", spectral_mag.std().item(), global_step
+                    )
+
+                    # Log per-position statistics (early vs late)
+                    seq_len = spectral.shape[1]
+                    early_mag = spectral_mag[:, : seq_len // 4].mean().item()
+                    late_mag = spectral_mag[:, -seq_len // 4 :].mean().item()
+                    logger.log_scalar("sat/spectral_early_pos_mag", early_mag, global_step)
+                    logger.log_scalar("sat/spectral_late_pos_mag", late_mag, global_step)
+
+                # Detect instability early
+                if loss.item() > 100 or torch.isnan(loss) or torch.isinf(loss):
+                    print(f"\n⚠️  INSTABILITY DETECTED at step {global_step}!")
+                    print(f"  Loss: {loss.item()}")
+                    print(f"  Gradient norms: {grad_norms}")
+                    print(f"  SAT stats: {sat_stats}")
 
             # Evaluation at intervals
             if (global_step + 1) % train_config.eval_interval == 0:

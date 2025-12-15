@@ -192,6 +192,21 @@ class SATConfig:
     n_fno_layers: int | None = None  # Number of FNO layers (default: n_layers)
     k_max: int | None = None  # Number of frequency modes (default: seq_len // 8)
 
+    # FNO activation function:
+    # - "modrelu": Hard threshold (can cause dead neurons)
+    # - "modsoftplus": Soft threshold (gradients always flow) [default]
+    # - "modelu": ELU-based (gradients always flow)
+    fno_activation: Literal["modrelu", "modsoftplus", "modelu"] = "modsoftplus"
+
+    # Output gating for FNO blocks: prevents early explosion
+    fno_output_gate: bool = True
+    fno_gate_init: float = 0.1  # Initial gate value (sigmoid applied)
+
+    # Cumulative FFT normalization:
+    # - "ortho": Standard 1/sqrt(N) normalization
+    # - "position": Per-position 1/sqrt(t+1) to keep magnitudes stable [default]
+    fft_normalization: Literal["ortho", "position"] = "position"
+
     # ===========================================================================
     # Integration Mode
     # ===========================================================================
