@@ -862,12 +862,78 @@ def train_sat(
                     logger.log_scalar("sat/spectral_early_pos_mag", early_mag, global_step)
                     logger.log_scalar("sat/spectral_late_pos_mag", late_mag, global_step)
 
-                # Detect instability early
-                if loss.item() > 100 or torch.isnan(loss) or torch.isinf(loss):
-                    print(f"\n⚠️  INSTABILITY DETECTED at step {global_step}!")
-                    print(f"  Loss: {loss.item()}")
-                    print(f"  Gradient norms: {grad_norms}")
-                    print(f"  SAT stats: {sat_stats}")
+                # Detect instability early and log detailed diagnostics
+                loss_val = loss.item()
+                is_unstable = loss_val > 100 or torch.isnan(loss) or torch.isinf(loss)
+                is_warning = loss_val > 10 or grad_norms.get("total_grad_norm", 0) > 10
+
+                if is_unstable or is_warning:
+                    print(
+                        f"\n{'⚠️  INSTABILITY' if is_unstable else '⚡ WARNING'} at step {global_step}!"
+                    )
+                    print(
+                        f"  Loss: {loss_val:.4f} (main: {main_loss.item():.4f}, aux: {aux_loss.item():.4f})"
+                    )
+                    print(f"  Gradient norms:")
+                    for k, v in sorted(grad_norms.items()):
+                        print(f"    {k}: {v:.4f}")
+                    print(f"  SAT diagnostics:")
+                    for k, v in sorted(sat_stats.items()):
+                        print(f"    {k}: {v:.6f}")
+
+                    # Detailed spectral analysis
+                    spectral_mag = torch.sqrt(
+                        spectral[..., 0].float() ** 2 + spectral[..., 1].float() ** 2
+                    )
+                    print(f"  Spectral magnitudes:")
+                    print(f"    mean: {spectral_mag.mean().item():.4f}")
+                    print(f"    max: {spectral_mag.max().item():.4f}")
+                    print(f"    std: {spectral_mag.std().item():.4f}")
+
+                    # Per-position analysis
+                    seq_len = spectral.shape[1]
+                    for pos_name, pos_slice in [
+                        ("early", slice(0, seq_len // 4)),
+                        ("mid", slice(seq_len // 4, 3 * seq_len // 4)),
+                        ("late", slice(3 * seq_len // 4, seq_len)),
+                    ]:
+                        pos_mag = spectral_mag[:, pos_slice]
+                        print(
+                            f"    {pos_name} pos mean: {pos_mag.mean().item():.4f}, max: {pos_mag.max().item():.4f}"
+                        )
+
+                    # Check for NaN/Inf in model parameters
+                    nan_params = []
+                    inf_params = []
+                    for name, p in model.named_parameters():
+                        if torch.isnan(p).any():
+                            nan_params.append(name)
+                        if torch.isinf(p).any():
+                            inf_params.append(name)
+                    if nan_params:
+                        print(f"  ❌ NaN in parameters: {nan_params}")
+                    if inf_params:
+                        print(f"  ❌ Inf in parameters: {inf_params}")
+
+                    # Check activations in the model for the current batch
+                    print(f"  Activation stats:")
+                    print(
+                        f"    logits mean: {logits.mean().item():.4f}, max: {logits.abs().max().item():.4f}"
+                    )
+
+                    # Log the FNO gate values
+                    if hasattr(model, "_orig_mod"):
+                        m = model._orig_mod
+                    else:
+                        m = model
+                    if hasattr(m, "fno_blocks"):
+                        for i, fno in enumerate(m.fno_blocks):
+                            if hasattr(fno, "output_gate") and fno.output_gate is not None:
+                                gate_val = torch.sigmoid(fno.output_gate).item()
+                                print(f"    FNO block {i} gate: {gate_val:.4f}")
+
+                if is_unstable:
+                    print("\n  💀 Training is likely about to collapse. Consider checkpointing.")
 
             # Evaluation at intervals
             if (global_step + 1) % train_config.eval_interval == 0:
