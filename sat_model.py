@@ -746,6 +746,101 @@ class FNOBlock(nn.Module):
 
 
 # ==============================================================================
+# Spectral Normalization
+# ==============================================================================
+
+
+def spectral_clip(z: torch.Tensor, max_magnitude: float = 10.0) -> torch.Tensor:
+    """
+    Clip complex magnitudes while preserving phase.
+
+    This prevents extreme outliers from destabilizing training.
+
+    Args:
+        z: Complex tensor (..., 2) in bfloat16 pair format
+        max_magnitude: Maximum allowed magnitude
+
+    Returns:
+        Clipped complex tensor (..., 2)
+    """
+    mag = complex_abs(z)  # (...)
+
+    # Compute clipping scale: min(1, max_magnitude / mag)
+    # This clips magnitudes > max_magnitude while leaving smaller ones unchanged
+    scale = torch.clamp(max_magnitude / (mag + 1e-8), max=1.0)
+
+    return z * scale.unsqueeze(-1)
+
+
+class SpectralLayerNorm(nn.Module):
+    """
+    Layer normalization for complex spectral tensors.
+
+    Normalizes magnitude while preserving phase. This prevents magnitude explosion
+    while maintaining the spectral structure.
+
+    Two modes:
+    - "magnitude": Normalize magnitude statistics, preserve phase
+    - "rms": RMS normalization of magnitude (simpler, no mean centering)
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        k_max: int,
+        eps: float = 1e-6,
+        mode: str = "rms",
+        learnable: bool = True,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.k_max = k_max
+        self.eps = eps
+        self.mode = mode
+        self.learnable = learnable
+
+        if learnable:
+            # Learnable scale per (feature, frequency) - applied to magnitude
+            self.scale = nn.Parameter(torch.ones(d_model, k_max, dtype=torch.bfloat16))
+        else:
+            self.register_parameter("scale", None)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            z: Complex tensor (batch, seq_len, d_model, k_max, 2)
+
+        Returns:
+            Normalized complex tensor (batch, seq_len, d_model, k_max, 2)
+        """
+        mag = complex_abs(z)  # (batch, seq_len, d_model, k_max)
+
+        if self.mode == "rms":
+            # RMS normalization: divide by RMS of magnitude
+            # Compute RMS over feature and frequency dimensions
+            rms = torch.sqrt((mag**2).mean(dim=(-2, -1), keepdim=True) + self.eps)
+            mag_normalized = mag / rms
+        else:  # magnitude
+            # Standard LayerNorm on magnitude
+            mean = mag.mean(dim=(-2, -1), keepdim=True)
+            var = ((mag - mean) ** 2).mean(dim=(-2, -1), keepdim=True)
+            mag_normalized = (mag - mean) / torch.sqrt(var + self.eps)
+            # Shift to positive (since magnitude should be positive)
+            mag_normalized = mag_normalized + 1.0  # Center around 1
+
+        # Scale normalized magnitude back to original complex
+        # z_new = z * (mag_normalized / mag)
+        scale_factor = mag_normalized / (mag + self.eps)
+        z_normalized = z * scale_factor.unsqueeze(-1)
+
+        # Apply learnable scale
+        if self.scale is not None:
+            z_normalized = z_normalized * self.scale.unsqueeze(0).unsqueeze(0).unsqueeze(-1)
+
+        return z_normalized
+
+
+# ==============================================================================
 # Bridge: Spectral to Transformer Conditioning
 # ==============================================================================
 
@@ -1224,6 +1319,20 @@ class SpectralAugmentedTransformer(nn.Module):
             ]
         )
 
+        # Spectral layer normalization (optional, applied after FNO blocks)
+        if config.spectral_layernorm is not None:
+            self.spectral_ln = SpectralLayerNorm(
+                config.d_spectral,
+                config.k_max,
+                mode=config.spectral_layernorm,
+                learnable=True,
+            )
+        else:
+            self.spectral_ln = None
+
+        # Store clipping threshold
+        self.spectral_clip_magnitude = config.spectral_clip_magnitude
+
         # =====================================================================
         # Bridge
         # =====================================================================
@@ -1311,9 +1420,21 @@ class SpectralAugmentedTransformer(nn.Module):
         # Cumulative FFT
         spectral = self.cumulative_fft(h_spectral)  # (B, T, D_spec, K, 2)
 
+        # Optional: clip spectral magnitudes to prevent outliers
+        if self.spectral_clip_magnitude is not None:
+            spectral = spectral_clip(spectral, self.spectral_clip_magnitude)
+
         # FNO blocks
         for fno_block in self.fno_blocks:
             spectral = fno_block(spectral)
+
+            # Optional: clip after each FNO block to prevent accumulation
+            if self.spectral_clip_magnitude is not None:
+                spectral = spectral_clip(spectral, self.spectral_clip_magnitude)
+
+        # Optional: spectral layer normalization after FNO blocks
+        if self.spectral_ln is not None:
+            spectral = self.spectral_ln(spectral)
 
         # =====================================================================
         # Bridge

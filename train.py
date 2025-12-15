@@ -258,6 +258,14 @@ def collect_sat_diagnostics(model: nn.Module) -> dict[str, float]:
                 stats[f"bridge_{i}_gamma_bias_mean"] = gamma_bias.mean().item()
                 stats[f"bridge_{i}_beta_bias_mean"] = beta_bias.mean().item()
 
+    # Spectral LayerNorm diagnostics
+    if hasattr(model, "spectral_ln") and model.spectral_ln is not None:
+        ln = model.spectral_ln
+        if hasattr(ln, "scale") and ln.scale is not None:
+            stats["spectral_ln_scale_mean"] = ln.scale.mean().item()
+            stats["spectral_ln_scale_max"] = ln.scale.max().item()
+            stats["spectral_ln_scale_min"] = ln.scale.min().item()
+
     return stats
 
 
@@ -867,7 +875,11 @@ def train_sat(
                 last_loss = loss_val
                 loss_val = loss.item()
                 is_unstable = loss_val > 100 or torch.isnan(loss) or torch.isinf(loss)
-                is_warning = loss_val > 10 or grad_norms.get("total_grad_norm", 0) > 10 or (loss_val - last_loss > 0.3 if last_loss is not None else False)
+                is_warning = (
+                    loss_val > 10
+                    or grad_norms.get("total_grad_norm", 0) > 10
+                    or (loss_val - last_loss > 0.3 if last_loss is not None else False)
+                )
 
                 if is_unstable or is_warning:
                     print(

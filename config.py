@@ -207,6 +207,16 @@ class SATConfig:
     # - "position": Per-position 1/sqrt(t+1) to keep magnitudes stable [default]
     fft_normalization: Literal["ortho", "position"] = "position"
 
+    # Spectral magnitude clipping: prevents extreme outliers
+    # Set to None to disable, or a float like 5.0 to clip magnitudes
+    spectral_clip_magnitude: float | None = 5.0
+
+    # Spectral layer normalization after FNO blocks
+    # - None: No normalization
+    # - "rms": RMS normalization (simpler, recommended)
+    # - "magnitude": Full LayerNorm on magnitude
+    spectral_layernorm: Literal["rms", "magnitude"] | None = "rms"
+
     # ===========================================================================
     # Integration Mode
     # ===========================================================================
