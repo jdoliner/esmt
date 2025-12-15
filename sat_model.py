@@ -985,24 +985,29 @@ class AdaptiveLayerNorm(nn.Module):
     """
     Adaptive Layer Normalization (AdaLN).
 
-    Instead of learned scale/shift, uses conditioning from external source:
-        AdaLN(x, gamma, beta) = gamma * LayerNorm(x) + beta
+    Instead of learned affine parameters, AdaLN uses input-dependent
+    gamma and beta provided by an external conditioning signal.
 
-    The gamma and beta are provided externally (from the spectral bridge).
+    AdaLN(x, γ, β) = γ * LayerNorm(x) + β
+
+    With gamma_scale option:
+    - Constrains gamma to be 1 + scale * tanh(gamma_input)
+    - This keeps gamma in range [1-scale, 1+scale], preventing drift
     """
 
-    def __init__(self, d_model: int, eps: float = 1e-6):
+    def __init__(self, d_model: int, eps: float = 1e-6, gamma_scale: float = 0.1):
         super().__init__()
         self.d_model = d_model
         self.eps = eps
-
-        # Note: No learnable parameters - gamma/beta come from conditioning
+        self.gamma_scale = gamma_scale
 
     def forward(self, x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: Input tensor (batch, seq_len, d_model)
             gamma: Scale tensor (batch, seq_len, d_model) or (batch, 1, d_model)
+                   If gamma_scale > 0, this is treated as pre-activation and
+                   transformed to 1 + gamma_scale * tanh(gamma)
             beta: Shift tensor (batch, seq_len, d_model) or (batch, 1, d_model)
 
         Returns:
@@ -1012,6 +1017,12 @@ class AdaptiveLayerNorm(nn.Module):
         mean = x.mean(dim=-1, keepdim=True)
         var = x.var(dim=-1, keepdim=True, unbiased=False)
         x_norm = (x - mean) / torch.sqrt(var + self.eps)
+
+        # Constrain gamma to stay close to 1
+        # gamma comes in centered around 1 from bridge, so subtract 1 before tanh
+        if self.gamma_scale > 0:
+            gamma_centered = gamma - 1.0  # Now centered around 0
+            gamma = 1.0 + self.gamma_scale * torch.tanh(gamma_centered / self.gamma_scale)
 
         # Apply conditioning
         return gamma * x_norm + beta
@@ -1030,7 +1041,9 @@ class CausalSelfAttentionAdaLN(nn.Module):
         self.d_model = config.d_model
 
         # Pre-norm with AdaLN
-        self.adaln = AdaptiveLayerNorm(config.d_model, eps=config.eps)
+        self.adaln = AdaptiveLayerNorm(
+            config.d_model, eps=config.eps, gamma_scale=config.adaln_gamma_scale
+        )
 
         # QKV projection
         self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
@@ -1167,7 +1180,9 @@ class MLPAdaLN(nn.Module):
         self.hidden_dim = config.d_model * config.mlp_ratio
 
         # Pre-norm with AdaLN
-        self.adaln = AdaptiveLayerNorm(config.d_model, eps=config.eps)
+        self.adaln = AdaptiveLayerNorm(
+            config.d_model, eps=config.eps, gamma_scale=config.adaln_gamma_scale
+        )
 
         # MLP layers
         self.fc1 = nn.Linear(config.d_model, self.hidden_dim)

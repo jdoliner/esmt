@@ -218,6 +218,15 @@ class SATConfig:
     spectral_layernorm: Literal["rms", "magnitude"] | None = "rms"
 
     # ===========================================================================
+    # AdaLN Stability
+    # ===========================================================================
+    # Constrain gamma to stay close to 1 to prevent drift
+    # gamma = 1 + adaln_gamma_scale * tanh((gamma_raw - 1) / adaln_gamma_scale)
+    # This keeps gamma in range [1 - scale, 1 + scale]
+    # Set to 0 to disable constraint (use raw gamma)
+    adaln_gamma_scale: float = 0.1
+
+    # ===========================================================================
     # Integration Mode
     # ===========================================================================
     # How the spectral stream conditions the transformer:
