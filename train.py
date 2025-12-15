@@ -639,8 +639,10 @@ def train_sat(
         weight_decay=train_config.weight_decay,
     )
 
-    # Mixed precision scaler
-    scaler = GradScaler("cuda")
+    # Note: We don't use GradScaler for SAT because:
+    # 1. bfloat16 has good numerical stability (unlike float16)
+    # 2. GradScaler doesn't support bfloat16 gradient unscaling
+    # We still use autocast for speed, just without scaling
 
     # Logger
     logger = TensorBoardLogger(train_config.log_dir, model_name)
@@ -700,16 +702,14 @@ def train_sat(
                 # Combined loss
                 loss = main_loss + aux_weight * aux_loss
 
-            # Backward pass with gradient scaling
-            scaler.scale(loss).backward()
+            # Backward pass (no GradScaler needed for bfloat16)
+            loss.backward()
 
             # Gradient clipping
-            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
 
             # Optimizer step
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
 
             # Logging
             epoch_loss += loss.item()
