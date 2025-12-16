@@ -1558,6 +1558,114 @@ class SpectralAugmentedTransformer(nn.Module):
 
         return loss
 
+    def compute_auxiliary_loss_with_diagnostics(
+        self,
+        spectral: torch.Tensor,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """
+        Compute auxiliary FNO prediction loss with detailed diagnostics.
+
+        Same as compute_auxiliary_loss but returns diagnostic statistics
+        to help debug the FNO training dynamics.
+
+        Returns:
+            Tuple of (loss, diagnostics_dict)
+        """
+        batch, seq_len = x.shape
+
+        # Re-embed and project
+        tok_emb = self.token_emb(x)
+        h_spectral = self.spectral_proj_in(tok_emb).to(torch.bfloat16)
+
+        # Get cumulative FFT (this is the target, detached)
+        with torch.no_grad():
+            target_fft = self.cumulative_fft(h_spectral)  # (B, T, D_spec, K, 2)
+
+        # FNO output at position t should predict FFT at position t+1
+        pred = spectral[:, :-1]  # (B, T-1, D_spec, K, 2)
+        target = target_fft[:, 1:]  # (B, T-1, D_spec, K, 2)
+
+        # Convert to float for diagnostics
+        pred_f = pred.float()
+        target_f = target.float()
+
+        # Compute magnitudes
+        pred_mag = torch.sqrt(pred_f[..., 0] ** 2 + pred_f[..., 1] ** 2)
+        target_mag = torch.sqrt(target_f[..., 0] ** 2 + target_f[..., 1] ** 2)
+
+        # Step 1: Scale comparison between pred and target
+        diagnostics = {
+            "pred_mag_mean": pred_mag.mean().item(),
+            "pred_mag_std": pred_mag.std().item(),
+            "pred_mag_max": pred_mag.max().item(),
+            "target_mag_mean": target_mag.mean().item(),
+            "target_mag_std": target_mag.std().item(),
+            "target_mag_max": target_mag.max().item(),
+            "scale_ratio": pred_mag.mean().item() / (target_mag.mean().item() + 1e-8),
+        }
+
+        # Step 2: Check if FNO is outputting near-constant values
+        # Variance across the batch and sequence dimensions
+        pred_variance_across_samples = pred_mag.var(dim=(0, 1)).mean().item()
+        pred_variance_across_features = pred_mag.var(dim=(2, 3)).mean().item()
+        diagnostics["pred_var_across_samples"] = pred_variance_across_samples
+        diagnostics["pred_var_across_features"] = pred_variance_across_features
+
+        # Step 3: Delta between consecutive FFT positions
+        # How different is FFT[0:t] from FFT[0:t+1]?
+        # This tells us if the prediction task is trivial
+        fft_at_t = target_fft[:, :-1].float()  # FFT[0:t] for t=0..T-2
+        fft_at_t_plus_1 = target_fft[:, 1:].float()  # FFT[0:t+1] for t=0..T-2
+
+        fft_t_mag = torch.sqrt(fft_at_t[..., 0] ** 2 + fft_at_t[..., 1] ** 2)
+        fft_t1_mag = torch.sqrt(fft_at_t_plus_1[..., 0] ** 2 + fft_at_t_plus_1[..., 1] ** 2)
+
+        # Absolute delta in magnitude
+        delta_mag = (fft_t1_mag - fft_t_mag).abs()
+        diagnostics["consecutive_delta_mag_mean"] = delta_mag.mean().item()
+        diagnostics["consecutive_delta_mag_max"] = delta_mag.max().item()
+
+        # Relative delta (as fraction of target magnitude)
+        relative_delta = delta_mag / (fft_t_mag + 1e-8)
+        diagnostics["consecutive_delta_relative_mean"] = relative_delta.mean().item()
+
+        # MSE between consecutive positions (trivial baseline)
+        consecutive_mse = ((fft_at_t - fft_at_t_plus_1) ** 2).mean().item()
+        diagnostics["consecutive_mse_baseline"] = consecutive_mse
+
+        # Actual prediction error
+        pred_error = ((pred_f - target_f) ** 2).mean().item()
+        diagnostics["pred_mse"] = pred_error
+
+        # How much better is our prediction than just copying previous?
+        # If this is ~1.0, the FNO isn't learning anything useful
+        # If this is < 1.0, the FNO is doing better than naive copy
+        diagnostics["pred_vs_copy_ratio"] = pred_error / (consecutive_mse + 1e-8)
+
+        # Check what the FNO is actually predicting vs the "just copy" baseline
+        copy_baseline_pred = spectral[:, :-1]  # What we'd predict by just copying
+        # Wait, that's the same as pred. Let me think...
+        # The "copy baseline" would be: predict FFT[0:t+1] ≈ FFT[0:t]
+        # So baseline error = MSE(FFT[0:t], FFT[0:t+1]) = consecutive_mse
+        # Our error = MSE(FNO_output[t], FFT[0:t+1]) = pred_error
+
+        # Compute weighted loss (same as main function)
+        k_max = self.config.k_max
+        assert k_max is not None
+        k_indices = torch.arange(k_max, device=x.device, dtype=torch.float32)
+        weights = torch.sqrt(k_indices + 1)
+        weights = weights / weights.sum()
+        weights = weights.view(1, 1, 1, -1, 1)
+
+        diff_squared = (pred_f - target_f) ** 2
+        weighted_diff = diff_squared * weights
+        loss = weighted_diff.mean()
+
+        diagnostics["weighted_loss"] = loss.item()
+
+        return loss, diagnostics
+
 
 def count_parameters(model: nn.Module) -> int:
     """Count trainable parameters in a model."""

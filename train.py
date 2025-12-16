@@ -871,6 +871,52 @@ def train_sat(
                     logger.log_scalar("sat/spectral_early_pos_mag", early_mag, global_step)
                     logger.log_scalar("sat/spectral_late_pos_mag", late_mag, global_step)
 
+                # FNO diagnostic logging (every 500 steps)
+                if global_step % 500 == 0:
+                    # Get detailed aux loss diagnostics
+                    _, fno_diag = model.compute_auxiliary_loss_with_diagnostics(spectral, x)
+
+                    print(f"\n📊 FNO Diagnostics at step {global_step}:")
+                    print(f"  Scale comparison (Step 1):")
+                    print(
+                        f"    pred_mag:   mean={fno_diag['pred_mag_mean']:.6f}, std={fno_diag['pred_mag_std']:.6f}, max={fno_diag['pred_mag_max']:.6f}"
+                    )
+                    print(
+                        f"    target_mag: mean={fno_diag['target_mag_mean']:.6f}, std={fno_diag['target_mag_std']:.6f}, max={fno_diag['target_mag_max']:.6f}"
+                    )
+                    print(f"    scale_ratio (pred/target): {fno_diag['scale_ratio']:.4f}")
+
+                    print(f"  FNO output variance (Step 2):")
+                    print(f"    variance across samples: {fno_diag['pred_var_across_samples']:.6f}")
+                    print(
+                        f"    variance across features: {fno_diag['pred_var_across_features']:.6f}"
+                    )
+
+                    print(f"  Consecutive FFT delta (Step 3):")
+                    print(f"    delta_mag_mean: {fno_diag['consecutive_delta_mag_mean']:.6f}")
+                    print(
+                        f"    delta_relative_mean: {fno_diag['consecutive_delta_relative_mean']:.4f} ({fno_diag['consecutive_delta_relative_mean'] * 100:.2f}%)"
+                    )
+                    print(
+                        f"    consecutive_mse (copy baseline): {fno_diag['consecutive_mse_baseline']:.6f}"
+                    )
+
+                    print(f"  Prediction quality:")
+                    print(f"    pred_mse: {fno_diag['pred_mse']:.6f}")
+                    print(f"    pred_vs_copy_ratio: {fno_diag['pred_vs_copy_ratio']:.4f}")
+                    if fno_diag["pred_vs_copy_ratio"] < 1.0:
+                        print(
+                            f"    ✅ FNO is {(1 - fno_diag['pred_vs_copy_ratio']) * 100:.1f}% better than naive copy"
+                        )
+                    else:
+                        print(
+                            f"    ❌ FNO is {(fno_diag['pred_vs_copy_ratio'] - 1) * 100:.1f}% WORSE than naive copy"
+                        )
+
+                    # Log to tensorboard
+                    for key, value in fno_diag.items():
+                        logger.log_scalar(f"fno_diag/{key}", value, global_step)
+
                 # Detect instability early and log detailed diagnostics
                 last_loss = loss_val
                 loss_val = loss.item()
