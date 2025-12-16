@@ -1482,9 +1482,21 @@ class SpectralAugmentedTransformer(nn.Module):
         # Each element is (gamma, beta) tuple for one layer
         adaln_conditioning = self.adaln_bridge(spectral_normalized)
 
+        # Ablation: shuffle conditioning across batch to break input-output correlation
+        # This tests whether the FNO signal is actually useful or just learned noise
+        if self.config.ablate_adaln_shuffle and self.training:
+            # Generate a random permutation of batch indices
+            perm = torch.randperm(batch, device=device)
+            # Shuffle gamma/beta for each layer
+            adaln_conditioning = [(gamma[perm], beta[perm]) for gamma, beta in adaln_conditioning]
+
         # Get cross-attention KV (if enabled) - also use normalized spectral
         if self.cross_attn_bridge is not None:
             spectral_k, spectral_v = self.cross_attn_bridge(spectral_normalized)
+            # Also shuffle cross-attention KV if ablating
+            if self.config.ablate_adaln_shuffle and self.training:
+                spectral_k = spectral_k[perm]
+                spectral_v = spectral_v[perm]
         else:
             spectral_k, spectral_v = None, None
 

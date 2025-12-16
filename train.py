@@ -1411,6 +1411,11 @@ def main():
         action="store_true",
         help="Enable gradient norm warnings for SAT training instability detection",
     )
+    parser.add_argument(
+        "--sat_ablate_shuffle",
+        action="store_true",
+        help="Ablation: shuffle AdaLN gamma/beta across batch to test if FNO signal is useful",
+    )
 
     args = parser.parse_args()
 
@@ -1529,6 +1534,7 @@ def main():
             aux_loss_weight=args.sat_aux_weight,
             aux_loss_weight_min=args.sat_aux_weight_min,
             grad_warnings=args.sat_grad_warnings,
+            ablate_adaln_shuffle=args.sat_ablate_shuffle,
         )
 
         print(f"SAT config: {sat_config.experiment_summary()}")

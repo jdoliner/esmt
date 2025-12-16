@@ -200,7 +200,9 @@ class SATConfig:
 
     # Output gating for FNO blocks: prevents early explosion
     fno_output_gate: bool = True
-    fno_gate_init: float = 2.0 # Initial gate value (sigmoid applied) - 2.0 gives ~0.88 pass-through
+    fno_gate_init: float = (
+        2.0  # Initial gate value (sigmoid applied) - 2.0 gives ~0.88 pass-through
+    )
 
     # Cumulative FFT normalization:
     # - "ortho": Standard 1/sqrt(N) normalization
@@ -254,6 +256,12 @@ class SATConfig:
     # Debugging and Testing
     # ========================================================================
     grad_warnings: bool = False
+
+    # Ablation: shuffle AdaLN conditioning to test if FNO signal is useful
+    # If True, gamma/beta are randomly permuted across the batch dimension,
+    # breaking the correlation between input and conditioning while preserving
+    # the distribution of gamma/beta values.
+    ablate_adaln_shuffle: bool = False
 
     def __post_init__(self):
         # Set defaults based on transformer config
