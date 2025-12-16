@@ -686,7 +686,7 @@ class FNOBlock(nn.Module):
         k_max: int,
         activation: str = "modsoftplus",
         use_output_gate: bool = True,
-        gate_init: float = 0.1,
+        gate_init: float = 2.0,
     ):
         super().__init__()
         self.d_model = d_model

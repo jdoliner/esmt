@@ -874,7 +874,20 @@ def train_sat(
                 # FNO diagnostic logging (every 500 steps)
                 if global_step % 500 == 0:
                     # Get detailed aux loss diagnostics
-                    _, fno_diag = model.compute_auxiliary_loss_with_diagnostics(spectral, x)
+                    diag_loss, fno_diag = model.compute_auxiliary_loss_with_diagnostics(spectral, x)
+
+                    # Step 0: Verify aux_loss matches diagnostic pred_mse
+                    print(f"\n🔍 Loss Verification at step {global_step}:")
+                    print(f"  aux_loss (from training):     {aux_loss.item():.6f}")
+                    print(f"  diag_loss (from diagnostics): {diag_loss.item():.6f}")
+                    print(f"  pred_mse (from diagnostics):  {fno_diag['pred_mse']:.6f}")
+                    print(f"  uniform_loss (from diag):     {fno_diag['uniform_loss']:.6f}")
+                    if abs(aux_loss.item() - fno_diag["pred_mse"]) > 1e-4:
+                        print(
+                            f"  ⚠️  MISMATCH: aux_loss != pred_mse (diff={abs(aux_loss.item() - fno_diag['pred_mse']):.6f})"
+                        )
+                    else:
+                        print(f"  ✅ aux_loss matches pred_mse")
 
                     print(f"\n📊 FNO Diagnostics at step {global_step}:")
                     print(f"  Scale comparison (Step 1):")
