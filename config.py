@@ -242,9 +242,9 @@ class SATConfig:
     # The aux loss (spectral MSE) is typically ~200x smaller than main loss (CE),
     # so we use a higher weight to balance gradient flow to the FNO.
     # A weight of 100-500 gives roughly equal gradient magnitude.
-    aux_loss_weight: float = 200.0
+    aux_loss_weight: float = 10.0
     # Minimum aux loss weight (after decay)
-    aux_loss_weight_min: float = 100.0
+    aux_loss_weight_min: float = 5.0
     # Fraction of training for warmup (aux_loss_weight = max)
     aux_loss_warmup_frac: float = 0.1
     # Fraction of training for decay (cosine decay from max to min)
