@@ -269,6 +269,69 @@ def collect_sat_diagnostics(model: nn.Module) -> dict[str, float]:
     return stats
 
 
+def collect_adaln_activation_diagnostics(
+    model: nn.Module, spectral: torch.Tensor
+) -> dict[str, float]:
+    """
+    Collect diagnostics on actual AdaLN gamma/beta activations.
+
+    This runs the spectral tensor through the bridge to see what
+    conditioning values are actually being produced.
+
+    Args:
+        model: SAT model
+        spectral: Spectral tensor from forward pass (B, T, D_spec, K, 2)
+
+    Returns:
+        Dict with AdaLN activation statistics
+    """
+    stats = {}
+
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+
+    if not hasattr(model, "adaln_bridge"):
+        return stats
+
+    # Get the normalized spectral (same as forward pass)
+    from sat_model import normalize_complex
+
+    spectral_normalized = normalize_complex(spectral)
+
+    # Run through bridge to get actual gamma/beta values
+    with torch.no_grad():
+        conditioning = model.adaln_bridge(spectral_normalized)
+
+    # Log statistics for each layer's conditioning
+    for i, (gamma, beta) in enumerate(conditioning):
+        # gamma and beta are (B, T, D) tensors
+        # At init, gamma should be ~1 and beta should be ~0
+
+        # Gamma statistics
+        stats[f"adaln_{i}_gamma_mean"] = gamma.mean().item()
+        stats[f"adaln_{i}_gamma_std"] = gamma.std().item()
+        stats[f"adaln_{i}_gamma_min"] = gamma.min().item()
+        stats[f"adaln_{i}_gamma_max"] = gamma.max().item()
+        # How far from 1 is gamma on average?
+        stats[f"adaln_{i}_gamma_deviation"] = (gamma - 1.0).abs().mean().item()
+
+        # Beta statistics
+        stats[f"adaln_{i}_beta_mean"] = beta.mean().item()
+        stats[f"adaln_{i}_beta_std"] = beta.std().item()
+        stats[f"adaln_{i}_beta_min"] = beta.min().item()
+        stats[f"adaln_{i}_beta_max"] = beta.max().item()
+        # How far from 0 is beta on average?
+        stats[f"adaln_{i}_beta_deviation"] = beta.abs().mean().item()
+
+    # Aggregate across all layers
+    all_gamma_devs = [stats[f"adaln_{i}_gamma_deviation"] for i in range(len(conditioning))]
+    all_beta_devs = [stats[f"adaln_{i}_beta_deviation"] for i in range(len(conditioning))]
+    stats["adaln_gamma_deviation_avg"] = sum(all_gamma_devs) / len(all_gamma_devs)
+    stats["adaln_beta_deviation_avg"] = sum(all_beta_devs) / len(all_beta_devs)
+
+    return stats
+
+
 def collect_complex_diagnostics(model: nn.Module) -> dict[str, float]:
     """
     Collect diagnostic statistics specific to complex models.
@@ -871,6 +934,11 @@ def train_sat(
                     logger.log_scalar("sat/spectral_early_pos_mag", early_mag, global_step)
                     logger.log_scalar("sat/spectral_late_pos_mag", late_mag, global_step)
 
+                    # Log AdaLN activation diagnostics
+                    adaln_stats = collect_adaln_activation_diagnostics(model, spectral)
+                    for key, value in adaln_stats.items():
+                        logger.log_scalar(f"adaln/{key}", value, global_step)
+
                 # FNO diagnostic logging (every 500 steps)
                 if global_step % 500 == 0:
                     # Get detailed aux loss diagnostics
@@ -922,6 +990,51 @@ def train_sat(
                     # Log to tensorboard
                     for key, value in fno_diag.items():
                         logger.log_scalar(f"fno_diag/{key}", value, global_step)
+
+                    # AdaLN activation diagnostics
+                    adaln_stats = collect_adaln_activation_diagnostics(model, spectral)
+                    print(f"\n🔗 AdaLN Conditioning Diagnostics:")
+                    print(f"  Aggregated across layers:")
+                    print(
+                        f"    gamma_deviation_avg: {adaln_stats['adaln_gamma_deviation_avg']:.6f} (distance from 1.0)"
+                    )
+                    print(
+                        f"    beta_deviation_avg:  {adaln_stats['adaln_beta_deviation_avg']:.6f} (distance from 0.0)"
+                    )
+
+                    # Show per-layer details for first and last layer
+                    n_layers = len(
+                        [k for k in adaln_stats if k.startswith("adaln_") and "_gamma_mean" in k]
+                    )
+                    print(f"  Layer 0 (first):")
+                    print(
+                        f"    gamma: mean={adaln_stats['adaln_0_gamma_mean']:.4f}, std={adaln_stats['adaln_0_gamma_std']:.4f}, range=[{adaln_stats['adaln_0_gamma_min']:.4f}, {adaln_stats['adaln_0_gamma_max']:.4f}]"
+                    )
+                    print(
+                        f"    beta:  mean={adaln_stats['adaln_0_beta_mean']:.4f}, std={adaln_stats['adaln_0_beta_std']:.4f}, range=[{adaln_stats['adaln_0_beta_min']:.4f}, {adaln_stats['adaln_0_beta_max']:.4f}]"
+                    )
+                    if n_layers > 1:
+                        last = n_layers - 1
+                        print(f"  Layer {last} (last):")
+                        print(
+                            f"    gamma: mean={adaln_stats[f'adaln_{last}_gamma_mean']:.4f}, std={adaln_stats[f'adaln_{last}_gamma_std']:.4f}, range=[{adaln_stats[f'adaln_{last}_gamma_min']:.4f}, {adaln_stats[f'adaln_{last}_gamma_max']:.4f}]"
+                        )
+                        print(
+                            f"    beta:  mean={adaln_stats[f'adaln_{last}_beta_mean']:.4f}, std={adaln_stats[f'adaln_{last}_beta_std']:.4f}, range=[{adaln_stats[f'adaln_{last}_beta_min']:.4f}, {adaln_stats[f'adaln_{last}_beta_max']:.4f}]"
+                        )
+
+                    # Check if conditioning is effectively doing nothing
+                    if (
+                        adaln_stats["adaln_gamma_deviation_avg"] < 0.01
+                        and adaln_stats["adaln_beta_deviation_avg"] < 0.01
+                    ):
+                        print(
+                            f"    ⚠️  WARNING: AdaLN conditioning is near-identity (gamma≈1, beta≈0)"
+                        )
+                        print(f"       The transformer may not be using FNO information!")
+
+                    for key, value in adaln_stats.items():
+                        logger.log_scalar(f"adaln/{key}", value, global_step)
 
                 # Detect instability early and log detailed diagnostics
                 last_loss = loss_val
