@@ -1506,6 +1506,10 @@ class SpectralAugmentedTransformer(nn.Module):
 
         We use sqrt(k+1) weighting to counteract pink noise bias.
 
+        The loss is normalized by the target magnitude to make it scale-invariant,
+        which ensures the aux loss is comparable to the main loss regardless of
+        the spectral magnitude scale.
+
         Args:
             spectral: FNO output (batch, seq_len, d_spectral, k_max, 2)
             x: Original input tokens (batch, seq_len)
@@ -1548,6 +1552,8 @@ class SpectralAugmentedTransformer(nn.Module):
         target_f = target.float()
         diff_squared = (pred_f - target_f) ** 2  # (B, T-1, D_spec, K, 2)
         weighted_diff = diff_squared * weights
+
+        # Raw MSE loss
         loss = weighted_diff.mean()
 
         return loss
