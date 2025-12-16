@@ -1545,25 +1545,15 @@ class SpectralAugmentedTransformer(nn.Module):
         pred = spectral[:, :-1]  # (B, T-1, D_spec, K, 2)
         target = target_fft[:, 1:]  # (B, T-1, D_spec, K, 2)
 
-        # Compute weighted MSE
-        # Weight by sqrt(k+1) to counteract pink noise
-        k_max = self.config.k_max
-        assert k_max is not None
-        k_indices = torch.arange(k_max, device=x.device, dtype=torch.float32)
-        weights = torch.sqrt(k_indices + 1)  # (K,)
-        weights = weights / weights.sum()  # Normalize
-
-        # Expand weights for broadcasting: (1, 1, 1, K, 1)
-        weights = weights.view(1, 1, 1, -1, 1)
-
-        # Weighted MSE - convert to float32 for numerical stability
+        # Uniform MSE - no frequency weighting
+        # Previous sqrt(k+1) weighting was de-emphasizing low frequencies,
+        # which are actually the hardest to predict and most important
         pred_f = pred.float()
         target_f = target.float()
         diff_squared = (pred_f - target_f) ** 2  # (B, T-1, D_spec, K, 2)
-        weighted_diff = diff_squared * weights
 
-        # Raw MSE loss
-        loss = weighted_diff.mean()
+        # Raw MSE loss (uniform weighting)
+        loss = diff_squared.mean()
 
         return loss
 
@@ -1662,25 +1652,15 @@ class SpectralAugmentedTransformer(nn.Module):
         diagnostics["pred_vs_copy_ratio"] = pred_error / (consecutive_mse + 1e-8)
 
         # Check what the FNO is actually predicting vs the "just copy" baseline
-        copy_baseline_pred = spectral[:, :-1]  # What we'd predict by just copying
-        # Wait, that's the same as pred. Let me think...
         # The "copy baseline" would be: predict FFT[0:t+1] ≈ FFT[0:t]
         # So baseline error = MSE(FFT[0:t], FFT[0:t+1]) = consecutive_mse
         # Our error = MSE(FNO_output[t], FFT[0:t+1]) = pred_error
 
-        # Compute weighted loss (same as main function)
-        k_max = self.config.k_max
-        assert k_max is not None
-        k_indices = torch.arange(k_max, device=x.device, dtype=torch.float32)
-        weights = torch.sqrt(k_indices + 1)
-        weights = weights / weights.sum()
-        weights = weights.view(1, 1, 1, -1, 1)
-
+        # Compute uniform MSE loss (same as main function)
         diff_squared = (pred_f - target_f) ** 2
-        weighted_diff = diff_squared * weights
-        loss = weighted_diff.mean()
+        loss = diff_squared.mean()
 
-        diagnostics["weighted_loss"] = loss.item()
+        diagnostics["uniform_loss"] = loss.item()
 
         return loss, diagnostics
 
