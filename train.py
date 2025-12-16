@@ -761,9 +761,16 @@ def train_sat(
     model = model.to(device)
 
     # Enable torch.compile for speedup
-    if train_config.compile_model and hasattr(torch, "compile"):
+    # Note: torch.compile doesn't work well with dynamic batch permutations (ablation shuffle)
+    if (
+        train_config.compile_model
+        and hasattr(torch, "compile")
+        and not sat_config.ablate_adaln_shuffle
+    ):
         print("Compiling model with torch.compile...")
         model = torch.compile(model)
+    elif sat_config.ablate_adaln_shuffle:
+        print("Skipping torch.compile (incompatible with ablation shuffle)")
 
     # Create data loaders
     train_loader = create_dataloader(
