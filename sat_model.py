@@ -772,6 +772,25 @@ def spectral_clip(z: torch.Tensor, max_magnitude: float = 10.0) -> torch.Tensor:
     return z * scale.unsqueeze(-1)
 
 
+def normalize_complex(z: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Normalize complex tensor to unit RMS magnitude while preserving phase.
+
+    This scales the tensor so that the root-mean-square of magnitudes is 1.
+    Useful for normalizing delta predictions to a consistent scale.
+
+    Args:
+        z: Complex tensor (..., 2) in bfloat16 pair format
+        eps: Small constant for numerical stability
+
+    Returns:
+        Normalized complex tensor (..., 2) with RMS magnitude ≈ 1
+    """
+    mag = complex_abs(z)  # (...)
+    rms = torch.sqrt((mag**2).mean() + eps)
+    return z / rms.unsqueeze(-1) if rms.ndim == 0 else z / rms
+
+
 class SpectralLayerNorm(nn.Module):
     """
     Layer normalization for complex spectral tensors.
@@ -1443,7 +1462,7 @@ class SpectralAugmentedTransformer(nn.Module):
         if self.spectral_ln is not None:
             spectral = self.spectral_ln(spectral)
 
-        # FNO blocks
+        # FNO blocks - output is interpreted as predicted delta (FFT[t+1] - FFT[t])
         for fno_block in self.fno_blocks:
             spectral = fno_block(spectral)
 
@@ -1455,13 +1474,17 @@ class SpectralAugmentedTransformer(nn.Module):
         # Bridge
         # =====================================================================
 
-        # Get AdaLN conditioning
-        # Each element is (gamma, beta) tuple for one layer
-        adaln_conditioning = self.adaln_bridge(spectral)
+        # Normalize the FNO output (predicted delta) before passing to AdaLN
+        # This ensures consistent scale for the bridge network regardless of delta magnitude
+        spectral_normalized = normalize_complex(spectral)
 
-        # Get cross-attention KV (if enabled)
+        # Get AdaLN conditioning from normalized predicted delta
+        # Each element is (gamma, beta) tuple for one layer
+        adaln_conditioning = self.adaln_bridge(spectral_normalized)
+
+        # Get cross-attention KV (if enabled) - also use normalized spectral
         if self.cross_attn_bridge is not None:
-            spectral_k, spectral_v = self.cross_attn_bridge(spectral)
+            spectral_k, spectral_v = self.cross_attn_bridge(spectral_normalized)
         else:
             spectral_k, spectral_v = None, None
 
@@ -1501,14 +1524,12 @@ class SpectralAugmentedTransformer(nn.Module):
         """
         Compute auxiliary FNO prediction loss.
 
-        The FNO should predict the next step's spectral state:
-            L_aux = weighted_MSE(FNO_output[t], FFT[0:t+1])
+        The FNO should predict the normalized delta between consecutive FFT positions:
+            L_aux = MSE(FNO_output[t], normalize(FFT[t+1] - FFT[t]))
 
-        We use sqrt(k+1) weighting to counteract pink noise bias.
-
-        The loss is normalized by the target magnitude to make it scale-invariant,
-        which ensures the aux loss is comparable to the main loss regardless of
-        the spectral magnitude scale.
+        By predicting the delta instead of the absolute FFT, the FNO is forced to
+        learn the actual dynamics rather than just approximating an identity function.
+        The delta is normalized to ensure consistent gradient scale.
 
         Args:
             spectral: FNO output (batch, seq_len, d_spectral, k_max, 2)
@@ -1519,16 +1540,11 @@ class SpectralAugmentedTransformer(nn.Module):
         """
         batch, seq_len = x.shape
 
-        # Get target: FFT of full sequence at each position (shifted by 1)
-        # We want target[t] = FFT(x[0:t+1])
-        # This is just the cumulative FFT shifted by 1 position
-
         # Re-embed and project
         tok_emb = self.token_emb(x)
         h_spectral = self.spectral_proj_in(tok_emb).to(torch.bfloat16)
 
-        # Get cumulative FFT (this is the target, detached)
-        # Apply the same normalization as the prediction path so they're on the same scale
+        # Get cumulative FFT
         with torch.no_grad():
             target_fft = self.cumulative_fft(h_spectral)  # (B, T, D_spec, K, 2)
 
@@ -1540,19 +1556,25 @@ class SpectralAugmentedTransformer(nn.Module):
             if self.spectral_ln is not None:
                 target_fft = self.spectral_ln(target_fft)
 
-        # FNO output at position t should predict FFT at position t+1
-        # So we compare spectral[:, :-1] with target_fft[:, 1:]
-        pred = spectral[:, :-1]  # (B, T-1, D_spec, K, 2)
-        target = target_fft[:, 1:]  # (B, T-1, D_spec, K, 2)
+            # Compute delta: FFT[t+1] - FFT[t]
+            # delta[t] = target_fft[t+1] - target_fft[t]
+            delta = target_fft[:, 1:] - target_fft[:, :-1]  # (B, T-1, D_spec, K, 2)
 
-        # Uniform MSE - no frequency weighting
-        # Previous sqrt(k+1) weighting was de-emphasizing low frequencies,
-        # which are actually the hardest to predict and most important
-        pred_f = pred.float()
-        target_f = target.float()
+            # Normalize the delta to unit RMS magnitude
+            target_delta_normalized = normalize_complex(delta)
+
+        # FNO output at position t should predict normalized delta
+        # pred[t] should match normalize(FFT[t+1] - FFT[t])
+        pred = spectral[:, :-1]  # (B, T-1, D_spec, K, 2)
+
+        # Normalize prediction as well for consistent comparison
+        pred_normalized = normalize_complex(pred)
+
+        # MSE loss between normalized predictions and normalized targets
+        pred_f = pred_normalized.float()
+        target_f = target_delta_normalized.float()
         diff_squared = (pred_f - target_f) ** 2  # (B, T-1, D_spec, K, 2)
 
-        # Raw MSE loss (uniform weighting)
         loss = diff_squared.mean()
 
         return loss
@@ -1577,8 +1599,7 @@ class SpectralAugmentedTransformer(nn.Module):
         tok_emb = self.token_emb(x)
         h_spectral = self.spectral_proj_in(tok_emb).to(torch.bfloat16)
 
-        # Get cumulative FFT (this is the target, detached)
-        # Apply the same normalization as the prediction path so they're on the same scale
+        # Get cumulative FFT
         with torch.no_grad():
             target_fft = self.cumulative_fft(h_spectral)  # (B, T, D_spec, K, 2)
 
@@ -1590,73 +1611,74 @@ class SpectralAugmentedTransformer(nn.Module):
             if self.spectral_ln is not None:
                 target_fft = self.spectral_ln(target_fft)
 
-        # FNO output at position t should predict FFT at position t+1
+            # Compute delta: FFT[t+1] - FFT[t]
+            delta = target_fft[:, 1:] - target_fft[:, :-1]  # (B, T-1, D_spec, K, 2)
+
+            # Normalize the delta
+            target_delta_normalized = normalize_complex(delta)
+
+        # FNO output at position t should predict normalized delta
         pred = spectral[:, :-1]  # (B, T-1, D_spec, K, 2)
-        target = target_fft[:, 1:]  # (B, T-1, D_spec, K, 2)
+        pred_normalized = normalize_complex(pred)
 
         # Convert to float for diagnostics
-        pred_f = pred.float()
-        target_f = target.float()
+        pred_f = pred_normalized.float()
+        target_f = target_delta_normalized.float()
 
-        # Compute magnitudes
-        pred_mag = torch.sqrt(pred_f[..., 0] ** 2 + pred_f[..., 1] ** 2)
-        target_mag = torch.sqrt(target_f[..., 0] ** 2 + target_f[..., 1] ** 2)
+        # Also get unnormalized versions for magnitude diagnostics
+        pred_unnorm_f = pred.float()
+        delta_unnorm_f = delta.float()
 
-        # Step 1: Scale comparison between pred and target
+        # Compute magnitudes (on unnormalized for interpretability)
+        pred_mag = torch.sqrt(pred_unnorm_f[..., 0] ** 2 + pred_unnorm_f[..., 1] ** 2)
+        delta_mag = torch.sqrt(delta_unnorm_f[..., 0] ** 2 + delta_unnorm_f[..., 1] ** 2)
+
+        # Step 1: Scale comparison (unnormalized pred vs unnormalized delta)
         diagnostics = {
             "pred_mag_mean": pred_mag.mean().item(),
             "pred_mag_std": pred_mag.std().item(),
             "pred_mag_max": pred_mag.max().item(),
-            "target_mag_mean": target_mag.mean().item(),
-            "target_mag_std": target_mag.std().item(),
-            "target_mag_max": target_mag.max().item(),
-            "scale_ratio": pred_mag.mean().item() / (target_mag.mean().item() + 1e-8),
+            "target_delta_mag_mean": delta_mag.mean().item(),
+            "target_delta_mag_std": delta_mag.std().item(),
+            "target_delta_mag_max": delta_mag.max().item(),
+            "scale_ratio": pred_mag.mean().item() / (delta_mag.mean().item() + 1e-8),
         }
 
         # Step 2: Check if FNO is outputting near-constant values
-        # Variance across the batch and sequence dimensions
         pred_variance_across_samples = pred_mag.var(dim=(0, 1)).mean().item()
         pred_variance_across_features = pred_mag.var(dim=(2, 3)).mean().item()
         diagnostics["pred_var_across_samples"] = pred_variance_across_samples
         diagnostics["pred_var_across_features"] = pred_variance_across_features
 
-        # Step 3: Delta between consecutive FFT positions
-        # How different is FFT[0:t] from FFT[0:t+1]?
-        # This tells us if the prediction task is trivial
-        fft_at_t = target_fft[:, :-1].float()  # FFT[0:t] for t=0..T-2
-        fft_at_t_plus_1 = target_fft[:, 1:].float()  # FFT[0:t+1] for t=0..T-2
+        # Step 3: Baseline comparison
+        # The "zero baseline" for delta prediction: predict delta = 0
+        # MSE of predicting zero = mean(delta^2) = variance of delta
+        zero_baseline_mse = (delta_unnorm_f**2).mean().item()
+        diagnostics["zero_baseline_mse"] = zero_baseline_mse
 
-        fft_t_mag = torch.sqrt(fft_at_t[..., 0] ** 2 + fft_at_t[..., 1] ** 2)
-        fft_t1_mag = torch.sqrt(fft_at_t_plus_1[..., 0] ** 2 + fft_at_t_plus_1[..., 1] ** 2)
-
-        # Absolute delta in magnitude
-        delta_mag = (fft_t1_mag - fft_t_mag).abs()
-        diagnostics["consecutive_delta_mag_mean"] = delta_mag.mean().item()
-        diagnostics["consecutive_delta_mag_max"] = delta_mag.max().item()
-
-        # Relative delta (as fraction of target magnitude)
-        relative_delta = delta_mag / (fft_t_mag + 1e-8)
-        diagnostics["consecutive_delta_relative_mean"] = relative_delta.mean().item()
-
-        # MSE between consecutive positions (trivial baseline)
-        consecutive_mse = ((fft_at_t - fft_at_t_plus_1) ** 2).mean().item()
-        diagnostics["consecutive_mse_baseline"] = consecutive_mse
-
-        # Actual prediction error
+        # Normalized prediction error
         pred_error = ((pred_f - target_f) ** 2).mean().item()
         diagnostics["pred_mse"] = pred_error
 
-        # How much better is our prediction than just copying previous?
-        # If this is ~1.0, the FNO isn't learning anything useful
-        # If this is < 1.0, the FNO is doing better than naive copy
-        diagnostics["pred_vs_copy_ratio"] = pred_error / (consecutive_mse + 1e-8)
+        # For normalized comparison, zero baseline would be MSE(0, normalized_delta)
+        # Since normalized_delta has RMS=1, this is approximately 1.0
+        zero_baseline_normalized = (target_f**2).mean().item()
+        diagnostics["zero_baseline_normalized_mse"] = zero_baseline_normalized
 
-        # Check what the FNO is actually predicting vs the "just copy" baseline
-        # The "copy baseline" would be: predict FFT[0:t+1] ≈ FFT[0:t]
-        # So baseline error = MSE(FFT[0:t], FFT[0:t+1]) = consecutive_mse
-        # Our error = MSE(FNO_output[t], FFT[0:t+1]) = pred_error
+        # How much better is our prediction than predicting zero?
+        # < 1.0 means FNO is learning something useful
+        diagnostics["pred_vs_zero_ratio"] = pred_error / (zero_baseline_normalized + 1e-8)
 
-        # Compute uniform MSE loss (same as main function)
+        # Cosine similarity between prediction and target (direction accuracy)
+        # Flatten for cosine computation
+        pred_flat = pred_f.reshape(-1)
+        target_flat = target_f.reshape(-1)
+        cosine_sim = (pred_flat * target_flat).sum() / (
+            pred_flat.norm() * target_flat.norm() + 1e-8
+        )
+        diagnostics["cosine_similarity"] = cosine_sim.item()
+
+        # Compute loss (same as main function)
         diff_squared = (pred_f - target_f) ** 2
         loss = diff_squared.mean()
 

@@ -881,7 +881,6 @@ def train_sat(
                     print(f"  aux_loss (from training):     {aux_loss.item():.6f}")
                     print(f"  diag_loss (from diagnostics): {diag_loss.item():.6f}")
                     print(f"  pred_mse (from diagnostics):  {fno_diag['pred_mse']:.6f}")
-                    print(f"  uniform_loss (from diag):     {fno_diag['uniform_loss']:.6f}")
                     if abs(aux_loss.item() - fno_diag["pred_mse"]) > 1e-4:
                         print(
                             f"  ⚠️  MISMATCH: aux_loss != pred_mse (diff={abs(aux_loss.item() - fno_diag['pred_mse']):.6f})"
@@ -889,41 +888,35 @@ def train_sat(
                     else:
                         print(f"  ✅ aux_loss matches pred_mse")
 
-                    print(f"\n📊 FNO Diagnostics at step {global_step}:")
-                    print(f"  Scale comparison (Step 1):")
+                    print(f"\n📊 FNO Delta Prediction Diagnostics at step {global_step}:")
+                    print(f"  Scale comparison (unnormalized):")
                     print(
                         f"    pred_mag:   mean={fno_diag['pred_mag_mean']:.6f}, std={fno_diag['pred_mag_std']:.6f}, max={fno_diag['pred_mag_max']:.6f}"
                     )
                     print(
-                        f"    target_mag: mean={fno_diag['target_mag_mean']:.6f}, std={fno_diag['target_mag_std']:.6f}, max={fno_diag['target_mag_max']:.6f}"
+                        f"    delta_mag:  mean={fno_diag['target_delta_mag_mean']:.6f}, std={fno_diag['target_delta_mag_std']:.6f}, max={fno_diag['target_delta_mag_max']:.6f}"
                     )
-                    print(f"    scale_ratio (pred/target): {fno_diag['scale_ratio']:.4f}")
+                    print(f"    scale_ratio (pred/delta): {fno_diag['scale_ratio']:.4f}")
 
-                    print(f"  FNO output variance (Step 2):")
+                    print(f"  FNO output variance:")
                     print(f"    variance across samples: {fno_diag['pred_var_across_samples']:.6f}")
                     print(
                         f"    variance across features: {fno_diag['pred_var_across_features']:.6f}"
                     )
 
-                    print(f"  Consecutive FFT delta (Step 3):")
-                    print(f"    delta_mag_mean: {fno_diag['consecutive_delta_mag_mean']:.6f}")
-                    print(
-                        f"    delta_relative_mean: {fno_diag['consecutive_delta_relative_mean']:.4f} ({fno_diag['consecutive_delta_relative_mean'] * 100:.2f}%)"
-                    )
-                    print(
-                        f"    consecutive_mse (copy baseline): {fno_diag['consecutive_mse_baseline']:.6f}"
-                    )
-
-                    print(f"  Prediction quality:")
+                    print(f"  Delta prediction quality (normalized):")
                     print(f"    pred_mse: {fno_diag['pred_mse']:.6f}")
-                    print(f"    pred_vs_copy_ratio: {fno_diag['pred_vs_copy_ratio']:.4f}")
-                    if fno_diag["pred_vs_copy_ratio"] < 1.0:
+                    print(f"    zero_baseline_mse: {fno_diag['zero_baseline_normalized_mse']:.6f}")
+                    print(f"    pred_vs_zero_ratio: {fno_diag['pred_vs_zero_ratio']:.4f}")
+                    print(f"    cosine_similarity: {fno_diag['cosine_similarity']:.4f}")
+
+                    if fno_diag["pred_vs_zero_ratio"] < 1.0:
                         print(
-                            f"    ✅ FNO is {(1 - fno_diag['pred_vs_copy_ratio']) * 100:.1f}% better than naive copy"
+                            f"    ✅ FNO is {(1 - fno_diag['pred_vs_zero_ratio']) * 100:.1f}% better than zero baseline"
                         )
                     else:
                         print(
-                            f"    ❌ FNO is {(fno_diag['pred_vs_copy_ratio'] - 1) * 100:.1f}% WORSE than naive copy"
+                            f"    ❌ FNO is {(fno_diag['pred_vs_zero_ratio'] - 1) * 100:.1f}% WORSE than zero baseline"
                         )
 
                     # Log to tensorboard
