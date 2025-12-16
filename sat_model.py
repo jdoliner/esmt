@@ -1446,7 +1446,9 @@ class SpectralAugmentedTransformer(nn.Module):
         # =====================================================================
 
         # Project to spectral dimension
-        h_spectral = self.spectral_proj_in(h)  # (B, T, D_spec)
+        # Note: We use tok_emb without pos_emb because the cumulative FFT
+        # naturally encodes position through phase relationships
+        h_spectral = self.spectral_proj_in(tok_emb)  # (B, T, D_spec)
 
         # Ensure bfloat16 for FFT
         h_spectral = h_spectral.to(torch.bfloat16)
