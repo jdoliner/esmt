@@ -1439,6 +1439,10 @@ class SpectralAugmentedTransformer(nn.Module):
         if self.spectral_clip_magnitude is not None:
             spectral = spectral_clip(spectral, self.spectral_clip_magnitude)
 
+        # Optional: spectral layer normalization after FNO blocks
+        if self.spectral_ln is not None:
+            spectral = self.spectral_ln(spectral)
+
         # FNO blocks
         for fno_block in self.fno_blocks:
             spectral = fno_block(spectral)
@@ -1446,10 +1450,6 @@ class SpectralAugmentedTransformer(nn.Module):
             # Optional: clip after each FNO block to prevent accumulation
             if self.spectral_clip_magnitude is not None:
                 spectral = spectral_clip(spectral, self.spectral_clip_magnitude)
-
-        # Optional: spectral layer normalization after FNO blocks
-        if self.spectral_ln is not None:
-            spectral = self.spectral_ln(spectral)
 
         # =====================================================================
         # Bridge
