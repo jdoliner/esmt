@@ -1528,8 +1528,17 @@ class SpectralAugmentedTransformer(nn.Module):
         h_spectral = self.spectral_proj_in(tok_emb).to(torch.bfloat16)
 
         # Get cumulative FFT (this is the target, detached)
+        # Apply the same normalization as the prediction path so they're on the same scale
         with torch.no_grad():
             target_fft = self.cumulative_fft(h_spectral)  # (B, T, D_spec, K, 2)
+
+            # Apply same clipping as forward pass
+            if self.spectral_clip_magnitude is not None:
+                target_fft = spectral_clip(target_fft, self.spectral_clip_magnitude)
+
+            # Apply same layer norm as forward pass
+            if self.spectral_ln is not None:
+                target_fft = self.spectral_ln(target_fft)
 
         # FNO output at position t should predict FFT at position t+1
         # So we compare spectral[:, :-1] with target_fft[:, 1:]
@@ -1579,8 +1588,17 @@ class SpectralAugmentedTransformer(nn.Module):
         h_spectral = self.spectral_proj_in(tok_emb).to(torch.bfloat16)
 
         # Get cumulative FFT (this is the target, detached)
+        # Apply the same normalization as the prediction path so they're on the same scale
         with torch.no_grad():
             target_fft = self.cumulative_fft(h_spectral)  # (B, T, D_spec, K, 2)
+
+            # Apply same clipping as forward pass
+            if self.spectral_clip_magnitude is not None:
+                target_fft = spectral_clip(target_fft, self.spectral_clip_magnitude)
+
+            # Apply same layer norm as forward pass
+            if self.spectral_ln is not None:
+                target_fft = self.spectral_ln(target_fft)
 
         # FNO output at position t should predict FFT at position t+1
         pred = spectral[:, :-1]  # (B, T-1, D_spec, K, 2)
