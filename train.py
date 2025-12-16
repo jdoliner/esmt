@@ -1232,13 +1232,13 @@ def main():
     parser.add_argument(
         "--sat_aux_weight",
         type=float,
-        default=1.0,
-        help="Initial weight for auxiliary FNO loss",
+        default=200.0,
+        help="Initial weight for auxiliary FNO loss (default 200 to balance with main loss)",
     )
     parser.add_argument(
         "--sat_aux_weight_min",
         type=float,
-        default=0.1,
+        default=100.0,
         help="Minimum auxiliary loss weight after decay",
     )
 
