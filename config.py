@@ -250,6 +250,11 @@ class SATConfig:
     # Fraction of training for decay (cosine decay from max to min)
     aux_loss_decay_end_frac: float = 0.8
 
+    # ========================================================================
+    # Debugging and Testing
+    # ========================================================================
+    grad_warnings: bool = False
+
     def __post_init__(self):
         # Set defaults based on transformer config
         if self.d_spectral is None:

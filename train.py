@@ -881,7 +881,7 @@ def train_sat(
                     or (loss_val - last_loss > 0.3 if last_loss is not None else False)
                 )
 
-                if is_unstable or is_warning:
+                if (is_unstable or is_warning) and sat_config.grad_warnings:
                     print(
                         f"\n{'⚠️  INSTABILITY' if is_unstable else '⚡ WARNING'} at step {global_step}!"
                     )
@@ -1241,6 +1241,11 @@ def main():
         default=100.0,
         help="Minimum auxiliary loss weight after decay",
     )
+    parser.add_argument(
+        "--sat_grad_warnings",
+        action="store_true",
+        help="Enable gradient norm warnings for SAT training instability detection",
+    )
 
     args = parser.parse_args()
 
@@ -1358,6 +1363,7 @@ def main():
             integration_mode=args.sat_integration,
             aux_loss_weight=args.sat_aux_weight,
             aux_loss_weight_min=args.sat_aux_weight_min,
+            grad_warnings=args.sat_grad_warnings,
         )
 
         print(f"SAT config: {sat_config.experiment_summary()}")

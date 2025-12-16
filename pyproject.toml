@@ -9,6 +9,7 @@ dependencies = [
     "datasets>=2.19.0",
     "tensorboard>=2.16.0",
     "tqdm>=4.66.0",
+    "ipdb>=0.13.13",
 ]
 
 [project.optional-dependencies]
