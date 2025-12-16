@@ -200,7 +200,7 @@ class SATConfig:
 
     # Output gating for FNO blocks: prevents early explosion
     fno_output_gate: bool = True
-    fno_gate_init: float = 0.1  # Initial gate value (sigmoid applied)
+    fno_gate_init: float = 2.0 # Initial gate value (sigmoid applied) - 2.0 gives ~0.88 pass-through
 
     # Cumulative FFT normalization:
     # - "ortho": Standard 1/sqrt(N) normalization
