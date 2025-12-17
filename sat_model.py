@@ -1448,7 +1448,7 @@ class SpectralAugmentedTransformer(nn.Module):
         # Project to spectral dimension
         # Note: We use tok_emb without pos_emb because the cumulative FFT
         # naturally encodes position through phase relationships
-        h_spectral = self.spectral_proj_in(tok_emb)  # (B, T, D_spec)
+        h_spectral = self.spectral_proj_in(h)  # (B, T, D_spec)
 
         # Ensure bfloat16 for FFT
         h_spectral = h_spectral.to(torch.bfloat16)
@@ -1556,7 +1556,11 @@ class SpectralAugmentedTransformer(nn.Module):
 
         # Re-embed and project
         tok_emb = self.token_emb(x)
-        h_spectral = self.spectral_proj_in(tok_emb).to(torch.bfloat16)
+        pos = torch.arange(seq_len, device=device)
+        pos_emb = self.pos_emb(pos)  # (T, D)
+
+        h = tok_emb + pos_emb  # (B, T, D)
+        h_spectral = self.spectral_proj_in(tok_emb + pos_emb).to(torch.bfloat16)
 
         # Get cumulative FFT
         with torch.no_grad():
