@@ -870,23 +870,32 @@ class AdaLNBridge(nn.Module):
 
     Architecture:
         spectral (B, T, D_spec, K, 2)
-        -> magnitude mean over K -> (B, T, D_spec)
-        -> shared_proj -> (B, T, D)
+        -> flatten to (B, T, D_spec * K * 2) preserving both magnitude and phase
+        -> two-layer MLP -> (B, T, D)
         -> per-layer proj -> (gamma_i, beta_i) for each layer
 
     The final projection is zero-initialized so that at init:
         gamma = 1, beta = 0 (standard LayerNorm behavior)
     """
 
-    def __init__(self, d_spectral: int, d_model: int, n_layers: int):
+    def __init__(self, d_spectral: int, d_model: int, n_layers: int, k_max: int):
         super().__init__()
         self.d_spectral = d_spectral
         self.d_model = d_model
         self.n_layers = n_layers
+        self.k_max = k_max
 
-        # Shared projection from spectral to model dimension
-        self.shared_proj = nn.Linear(d_spectral, d_model)
-        self.act = nn.SiLU()
+        # Input dimension: flatten full complex spectral tensor
+        # This preserves both magnitude and phase information
+        input_dim = d_spectral * k_max * 2
+
+        # Two-layer MLP to project from flattened spectral to model dimension
+        # Use an intermediate dimension to avoid too aggressive compression
+        hidden_dim = max(d_model * 4, input_dim // 4)
+        self.proj1 = nn.Linear(input_dim, hidden_dim)
+        self.act1 = nn.SiLU()
+        self.proj2 = nn.Linear(hidden_dim, d_model)
+        self.act2 = nn.SiLU()
 
         # Per-layer projections to (gamma, beta)
         self.layer_projs = nn.ModuleList([nn.Linear(d_model, 2 * d_model) for _ in range(n_layers)])
@@ -894,9 +903,11 @@ class AdaLNBridge(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        # Standard init for shared projection
-        nn.init.normal_(self.shared_proj.weight, std=0.02)
-        nn.init.zeros_(self.shared_proj.bias)
+        # Standard init for shared projections
+        nn.init.normal_(self.proj1.weight, std=0.02)
+        nn.init.zeros_(self.proj1.bias)
+        nn.init.normal_(self.proj2.weight, std=0.02)
+        nn.init.zeros_(self.proj2.bias)
 
         # Zero-init for layer projections so gamma=1, beta=0 at start
         for i in range(len(self.layer_projs)):
@@ -918,17 +929,20 @@ class AdaLNBridge(nn.Module):
         Returns:
             List of (gamma, beta) tuples for each layer, each shape (batch, seq_len, d_model)
         """
-        # Compute magnitude and mean over frequency dimension
-        # spectral: (B, T, D_spec, K, 2)
-        magnitude = complex_abs(spectral)  # (B, T, D_spec, K)
-        pooled = magnitude.mean(dim=-1)  # (B, T, D_spec)
+        batch, seq_len, d_spectral, k_max, _ = spectral.shape
+
+        # Flatten the full complex tensor to preserve magnitude and phase
+        # spectral: (B, T, D_spec, K, 2) -> (B, T, D_spec * K * 2)
+        flat = spectral.view(batch, seq_len, -1)
 
         # Convert to float32 for projection
-        pooled = pooled.float()
+        flat = flat.float()
 
-        # Shared projection
-        hidden = self.shared_proj(pooled)  # (B, T, D)
-        hidden = self.act(hidden)
+        # Two-layer MLP
+        hidden = self.proj1(flat)  # (B, T, hidden_dim)
+        hidden = self.act1(hidden)
+        hidden = self.proj2(hidden)  # (B, T, D)
+        hidden = self.act2(hidden)
 
         # Per-layer projections
         conditioning = []
@@ -1372,7 +1386,9 @@ class SpectralAugmentedTransformer(nn.Module):
         # =====================================================================
 
         # AdaLN bridge (always created, provides default gamma=1, beta=0 if not used)
-        self.adaln_bridge = AdaLNBridge(config.d_spectral, config.d_model, config.n_layers)
+        self.adaln_bridge = AdaLNBridge(
+            config.d_spectral, config.d_model, config.n_layers, config.k_max
+        )
 
         # Cross-attention bridge (optional)
         if config.integration_mode in ["cross_attention", "both"]:
