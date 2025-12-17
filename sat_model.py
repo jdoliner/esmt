@@ -1553,6 +1553,7 @@ class SpectralAugmentedTransformer(nn.Module):
             Auxiliary loss scalar
         """
         batch, seq_len = x.shape
+        device = x.device
 
         # Re-embed and project
         tok_emb = self.token_emb(x)
