@@ -897,6 +897,10 @@ class AdaLNBridge(nn.Module):
         self.proj2 = nn.Linear(hidden_dim, d_model)
         self.act2 = nn.SiLU()
 
+        # LayerNorm to stabilize the hidden representation before gamma/beta projection
+        # This prevents extreme values from compounding through transformer layers
+        self.ln = nn.LayerNorm(d_model)
+
         # Per-layer projections to (gamma, beta)
         self.layer_projs = nn.ModuleList([nn.Linear(d_model, 2 * d_model) for _ in range(n_layers)])
 
@@ -943,6 +947,9 @@ class AdaLNBridge(nn.Module):
         hidden = self.act1(hidden)
         hidden = self.proj2(hidden)  # (B, T, D)
         hidden = self.act2(hidden)
+
+        # Normalize to prevent extreme gamma/beta values
+        hidden = self.ln(hidden)
 
         # Per-layer projections
         conditioning = []
