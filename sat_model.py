@@ -892,6 +892,10 @@ class AdaLNBridge(nn.Module):
         # Two-layer MLP to project from flattened spectral to model dimension
         # Use an intermediate dimension to avoid too aggressive compression
         hidden_dim = max(d_model * 4, input_dim // 4)
+
+        # LayerNorm on input to handle varying spectral magnitudes
+        self.ln_in = nn.LayerNorm(input_dim)
+
         self.proj1 = nn.Linear(input_dim, hidden_dim)
         self.act1 = nn.SiLU()
         self.proj2 = nn.Linear(hidden_dim, d_model)
@@ -903,6 +907,10 @@ class AdaLNBridge(nn.Module):
 
         # Per-layer projections to (gamma, beta)
         self.layer_projs = nn.ModuleList([nn.Linear(d_model, 2 * d_model) for _ in range(n_layers)])
+
+        # Scale factor for beta to prevent large shifts
+        # Beta is scaled by tanh to keep it bounded
+        self.beta_scale = 1.0
 
         self._init_weights()
 
@@ -942,6 +950,9 @@ class AdaLNBridge(nn.Module):
         # Convert to float32 for projection
         flat = flat.float()
 
+        # Normalize input to handle varying spectral magnitudes
+        flat = self.ln_in(flat)
+
         # Two-layer MLP
         hidden = self.proj1(flat)  # (B, T, hidden_dim)
         hidden = self.act1(hidden)
@@ -957,6 +968,8 @@ class AdaLNBridge(nn.Module):
             gamma_beta = proj(hidden)  # (B, T, 2*D)
             gamma = gamma_beta[..., : self.d_model]  # (B, T, D)
             beta = gamma_beta[..., self.d_model :]  # (B, T, D)
+            # Bound beta with tanh to prevent large shifts
+            beta = self.beta_scale * torch.tanh(beta / self.beta_scale)
             conditioning.append((gamma, beta))
 
         return conditioning
