@@ -1613,10 +1613,13 @@ class SpectralAugmentedTransformer(nn.Module):
             Tuple of (loss, diagnostics_dict)
         """
         batch, seq_len = x.shape
+        device = x.device
 
         # Re-embed and project
         tok_emb = self.token_emb(x)
-        h_spectral = self.spectral_proj_in(tok_emb).to(torch.bfloat16)
+        pos = torch.arange(seq_len, device=device)
+        pos_emb = self.pos_emb(pos)  # (T, D)
+        h_spectral = self.spectral_proj_in(tok_emb + pos_emb).to(torch.bfloat16)
 
         # Get cumulative FFT
         with torch.no_grad():
