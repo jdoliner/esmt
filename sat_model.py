@@ -1916,13 +1916,9 @@ class BidirectionalSelfAttention(nn.Module):
         k = k.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Attention scores (no causal mask!)
-        scale = 1.0 / math.sqrt(self.head_dim)
-        attn = (q @ k.transpose(-2, -1)) * scale
-        attn = F.softmax(attn, dim=-1)
-
-        # Attend to values
-        out = attn @ v  # (batch, heads, seq, head_dim)
+        # Use scaled_dot_product_attention for memory efficiency (Flash Attention)
+        # No causal mask for bidirectional attention
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
 
         # Reshape and project
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, d_model)
@@ -2196,54 +2192,39 @@ class SpectralInjectionTransformer(nn.Module):
             else:
                 h = block(h)
 
-        # Final layer norm and projection
-        h = self.ln_f(h)
-        logits = self.lm_head(h)  # (B*T, seq_len, vocab)
-
-        # Reshape back: (B, T, seq_len, vocab)
-        logits = logits.view(batch, seq_len, seq_len, -1)
+        # Final layer norm
+        h = self.ln_f(h)  # (B*T, seq_len, d_model)
 
         # =====================================================================
-        # Extract Predictions
+        # Extract Only Needed Hidden States Before lm_head
         # =====================================================================
+        # We only need predictions at position t+1 for each source position t.
+        # Instead of computing (B*T, seq_len, vocab) and then gathering,
+        # we first gather the hidden states, then project to vocab.
+        # This reduces memory from O(B*T*T*vocab) to O(B*T*vocab).
 
-        # For each source position t, we want the prediction at position t+1
-        # logits[b, t, t+1, :] is the prediction for token t+1 given tokens [0:t+1]
+        # Reshape h: (B*T, seq_len, d_model) -> (B, T, seq_len, d_model)
+        h = h.view(batch, seq_len, seq_len, -1)
 
-        # Gather the diagonal+1 predictions
-        # We want logits[:, t, t+1, :] for t in [0, seq_len-1]
-        # But position seq_len-1 predicts seq_len which is out of bounds
+        # For source position t, we want the hidden state at target position t+1
+        # This is h[b, t, t+1, :] for t in [0, T-2]
+        # And h[b, T-1, T-1, :] for t = T-1 (placeholder, predicts nothing)
 
-        # Create indices for gathering: for each t, get position t+1
-        # t_range: [0, 1, ..., seq_len-1]
-        # target_pos: [1, 2, ..., seq_len] but seq_len is OOB
-
-        # For the last position, we'll just return the last valid prediction
-        # and handle it in the loss computation
-
-        # Actually, simpler: return full logits and let training code handle extraction
-        # The training code needs to compute loss at [t, t+1] for t in [0, T-2]
-
-        # For now, return the "next token" predictions directly
-        # output[b, t, :] = logits[b, t, t+1, :] for t < T-1
-        #                 = logits[b, T-1, T-1, :] for t = T-1 (placeholder)
-
-        # Efficient gathering using diagonal indexing
-        # We want the super-diagonal of the (T, seq_len) matrix for each batch and vocab
-
-        # Create indices
+        # Create indices for gathering the diagonal+1
         t_indices = torch.arange(seq_len - 1, device=device)  # [0, 1, ..., T-2]
         tp1_indices = t_indices + 1  # [1, 2, ..., T-1]
 
-        # Gather: logits[b, t, t+1, v] for t in [0, T-2]
-        # Shape: (B, T-1, vocab)
-        next_token_logits = logits[:, t_indices, tp1_indices, :]  # (B, T-1, vocab)
+        # Gather hidden states: h[b, t, t+1, :] for t in [0, T-2]
+        # Shape: (B, T-1, d_model)
+        next_hidden = h[:, t_indices, tp1_indices, :]  # (B, T-1, d_model)
 
-        # For the last position, use the prediction at (T-1, T-1)
-        # This is a placeholder - in practice, we don't compute loss here
-        last_logits = logits[:, -1, -1, :].unsqueeze(1)  # (B, 1, vocab)
+        # For the last position, use hidden state at (T-1, T-1)
+        last_hidden = h[:, -1, -1, :].unsqueeze(1)  # (B, 1, d_model)
 
-        # Concatenate to get (B, T, vocab)
-        output_logits = torch.cat([next_token_logits, last_logits], dim=1)
+        # Concatenate to get (B, T, d_model)
+        output_hidden = torch.cat([next_hidden, last_hidden], dim=1)
+
+        # NOW project to vocab - this is only (B, T, vocab) instead of (B*T, T, vocab)
+        output_logits = self.lm_head(output_hidden)  # (B, T, vocab)
 
         return output_logits
