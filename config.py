@@ -324,6 +324,92 @@ class SATConfig:
 
 
 @dataclass
+class SITConfig:
+    """Configuration for the Spectral Injection Transformer (SIT).
+
+    This model uses FFT/iFFT to cleanly separate spectral and time-domain processing:
+    - Cumulative FFT converts token embeddings to spectral domain
+    - FNO processes spectral representations
+    - iFFT converts back to time domain
+    - Spectral predictions are injected into transformer input
+    - Bidirectional attention (no causal mask) since causality is enforced
+      by zeroing out future token embeddings
+
+    Key insight: The iFFT of FNO output contains predictions for ALL positions,
+    including future ones. These predictions are derived only from past tokens
+    (via cumulative FFT), so attending to them doesn't violate causality.
+
+    MEMORY WARNING: This architecture has O(B * T^2 * D) memory for the transformer
+    input and O(B * T^3 * heads) for attention scores. For seq_len=512, batch_size=4,
+    this requires ~40GB+ GPU memory. Use smaller seq_len (128-256) for experimentation.
+    """
+
+    # ===========================================================================
+    # Transformer Configuration
+    # ===========================================================================
+    d_model: int = 64  # Transformer hidden dimension
+    n_layers: int = 6  # Number of transformer blocks
+    n_heads: int = 8  # Number of attention heads
+    vocab_size: int = 50257  # GPT-2 tokenizer vocabulary size
+    seq_len: int = 512  # Maximum sequence length (should be power of 2 for FFT)
+    mlp_ratio: int = 4  # MLP expansion ratio
+    dropout: float = 0.0  # Dropout rate
+    eps: float = 1e-6  # LayerNorm epsilon
+
+    # ===========================================================================
+    # Spectral Stream (FNO) Configuration
+    # ===========================================================================
+    d_spectral: int | None = None  # Spectral dimension (default: d_model // 4)
+    n_fno_layers: int | None = None  # Number of FNO layers (default: n_layers // 2)
+    k_max: int | None = None  # Number of frequency modes (default: seq_len // 16)
+
+    # FNO activation function
+    fno_activation: Literal["modrelu", "modsoftplus", "modelu"] = "modsoftplus"
+
+    # Output gating for FNO blocks
+    fno_output_gate: bool = True
+    fno_gate_init: float = 2.0
+
+    # ===========================================================================
+    # Injection Configuration
+    # ===========================================================================
+    # Gate initialization for spectral injection (sigmoid applied)
+    # Lower values = less spectral influence at init
+    injection_gate_init: float = -2.0  # sigmoid(-2) ≈ 0.12
+
+    # Whether to include positional embeddings in future (zeroed) token slots
+    include_future_pos_emb: bool = True
+
+    def __post_init__(self):
+        # Set defaults based on transformer config
+        if self.d_spectral is None:
+            self.d_spectral = self.d_model // 4
+        if self.n_fno_layers is None:
+            self.n_fno_layers = max(2, self.n_layers // 2)
+        if self.k_max is None:
+            self.k_max = self.seq_len // 16
+
+        # Validations
+        assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
+        assert self.d_spectral > 0, "d_spectral must be positive"
+        assert self.n_fno_layers > 0, "n_fno_layers must be positive"
+        assert self.k_max > 0, "k_max must be positive"
+        assert self.seq_len & (self.seq_len - 1) == 0, "seq_len should be power of 2"
+
+    @property
+    def head_dim(self) -> int:
+        return self.d_model // self.n_heads
+
+    def experiment_summary(self) -> str:
+        """Return a summary of configuration."""
+        return (
+            f"SIT(d={self.d_model}, d_spec={self.d_spectral}, "
+            f"layers={self.n_layers}, fno={self.n_fno_layers}, "
+            f"k_max={self.k_max})"
+        )
+
+
+@dataclass
 class NanoGPTConfig:
     """Configuration for the NanoGPT baseline."""
 
