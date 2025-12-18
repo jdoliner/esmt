@@ -616,47 +616,38 @@ class SpectralConv1d(nn.Module):
         # x: (batch, seq_len, d_in, k_max, 2)
         # weight: (d_out, d_in, k_max, 2)
 
-        batch, seq_len, d_in, k_max, _ = x.shape
+        B, T, d_in, K, _ = x.shape
 
         # For each frequency mode k, we do a complex matrix-vector product:
         # out[b, t, d_out, k] = sum_d_in weight[d_out, d_in, k] * x[b, t, d_in, k]
+        #
+        # This is equivalent to K independent matrix multiplications.
+        # We use bmm by treating K as the batch dimension.
 
-        # Reshape for batch matmul
-        # x: (batch * seq_len, k_max, d_in, 2) -> we need (batch*seq*k, d_in, 2)
-        x_reshape = x.permute(0, 1, 3, 2, 4)  # (batch, seq, k_max, d_in, 2)
-        x_reshape = x_reshape.reshape(batch * seq_len * k_max, d_in, 2)
+        x_real, x_imag = x[..., 0], x[..., 1]  # (B, T, d_in, K)
+        w_real = self.weight[..., 0]  # (d_out, d_in, K)
+        w_imag = self.weight[..., 1]
 
-        # weight: (d_out, d_in, k_max, 2) -> (k_max, d_out, d_in, 2)
-        w_reshape = self.weight.permute(2, 0, 1, 3)  # (k_max, d_out, d_in, 2)
+        # Reshape: x -> (K, B*T, d_in), w -> (K, d_out, d_in)
+        x_real = x_real.permute(3, 0, 1, 2).reshape(K, B * T, d_in)  # (K, B*T, d_in)
+        x_imag = x_imag.permute(3, 0, 1, 2).reshape(K, B * T, d_in)
+        w_real = w_real.permute(2, 0, 1)  # (K, d_out, d_in)
+        w_imag = w_imag.permute(2, 0, 1)
 
-        # Complex matmul for each frequency mode
-        x_real, x_imag = x_reshape[..., 0], x_reshape[..., 1]  # (batch*seq*k, d_in)
+        # Batched matmul: (K, B*T, d_in) @ (K, d_in, d_out) -> (K, B*T, d_out)
+        # Complex multiplication: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+        out_real = torch.bmm(x_real, w_real.transpose(1, 2)) - torch.bmm(
+            x_imag, w_imag.transpose(1, 2)
+        )
+        out_imag = torch.bmm(x_real, w_imag.transpose(1, 2)) + torch.bmm(
+            x_imag, w_real.transpose(1, 2)
+        )
 
-        # Expand weight for batch processing
-        # We need to apply the same weight[k] to all (batch*seq) samples for that k
-        out_list = []
-        for k in range(k_max):
-            # Get samples for this frequency
-            start_idx = k
-            indices = torch.arange(start_idx, batch * seq_len * k_max, k_max, device=x.device)
-            x_k_real = x_real[indices]  # (batch*seq, d_in)
-            x_k_imag = x_imag[indices]  # (batch*seq, d_in)
+        # Reshape back: (K, B*T, d_out) -> (B, T, d_out, K)
+        out_real = out_real.reshape(K, B, T, self.d_out).permute(1, 2, 3, 0)
+        out_imag = out_imag.reshape(K, B, T, self.d_out).permute(1, 2, 3, 0)
 
-            w_k_real = w_reshape[k, :, :, 0]  # (d_out, d_in)
-            w_k_imag = w_reshape[k, :, :, 1]  # (d_out, d_in)
-
-            # Complex matmul: (d_out, d_in) @ (batch*seq, d_in).T -> (d_out, batch*seq)
-            out_k_real = F.linear(x_k_real, w_k_real) - F.linear(x_k_imag, w_k_imag)
-            out_k_imag = F.linear(x_k_real, w_k_imag) + F.linear(x_k_imag, w_k_real)
-
-            out_list.append(torch.stack([out_k_real, out_k_imag], dim=-1))
-
-        # Stack and reshape back
-        # out_list[k]: (batch*seq, d_out, 2)
-        out = torch.stack(out_list, dim=2)  # (batch*seq, d_out, k_max, 2)
-        out = out.reshape(batch, seq_len, self.d_out, k_max, 2)
-
-        return out
+        return torch.stack([out_real, out_imag], dim=-1)
 
 
 class FNOBlock(nn.Module):
@@ -1533,8 +1524,10 @@ class SpectralAugmentedTransformer(nn.Module):
             spectral_k, spectral_v = self.cross_attn_bridge(spectral_normalized)
             # Also shuffle cross-attention KV if ablating
             if self.config.ablate_adaln_shuffle and self.training:
-                spectral_k = spectral_k[perm]
-                spectral_v = spectral_v[perm]
+                # perm was defined above when ablate_adaln_shuffle is True
+                shuffle_perm = torch.randperm(batch, device=device)
+                spectral_k = spectral_k[shuffle_perm]
+                spectral_v = spectral_v[shuffle_perm]
         else:
             spectral_k, spectral_v = None, None
 
