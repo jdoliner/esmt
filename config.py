@@ -226,7 +226,7 @@ class SATConfig:
     # gamma = 1 + adaln_gamma_scale * tanh((gamma_raw - 1) / adaln_gamma_scale)
     # This keeps gamma in range [1 - scale, 1 + scale]
     # Set to 0 to disable constraint (use raw gamma)
-    adaln_gamma_scale: float = 0.5
+    adaln_gamma_scale: float = 2.0
 
     # ===========================================================================
     # Integration Mode
