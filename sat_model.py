@@ -2049,7 +2049,7 @@ class SpectralInjectionTransformer(nn.Module):
 
         # Learnable gate for spectral injection (starts small)
         self.injection_gate = nn.Parameter(
-            torch.tensor(config.injection_gate_init, dtype=torch.float32)
+            torch.tensor(config.injection_gate_init, dtype=torch.bfloat16)
         )
 
         # =====================================================================
@@ -2123,8 +2123,7 @@ class SpectralInjectionTransformer(nn.Module):
         # For each source position t, we get predictions for all target positions
         spectral_time = self.cumulative_ifft(spectral)
 
-        # Project back to model dimension
-        spectral_time = spectral_time.float()  # (B, T, seq_len, D_spec)
+        # Project back to model dimension (keep in bfloat16)
         spectral_pred = self.spectral_proj_out(spectral_time)  # (B, T, seq_len, D)
 
         # Apply injection gate
@@ -2142,7 +2141,7 @@ class SpectralInjectionTransformer(nn.Module):
         # Create causal mask: (T, seq_len) where mask[t, t'] = 1 if t' <= t
         t_indices = torch.arange(seq_len, device=device).unsqueeze(1)  # (T, 1)
         tp_indices = torch.arange(seq_len, device=device).unsqueeze(0)  # (1, seq_len)
-        causal_mask = (tp_indices <= t_indices).float()  # (T, seq_len)
+        causal_mask = (tp_indices <= t_indices).to(tok_emb.dtype)  # (T, seq_len)
 
         # Expand embeddings for the (B, T, seq_len, D) construction
         # tok_emb: (B, T, D) -> need (B, T, seq_len, D)
