@@ -1345,17 +1345,12 @@ def train_sit(
 
             with autocast("cuda", dtype=torch.bfloat16):
                 # Forward pass
-                # logits[t] predicts token t+1
                 logits = model(x)  # (B, T, vocab)
 
-                # Loss: compare logits[:-1] to y[1:]
-                # logits[t] should predict y[t+1]
-                logits_for_loss = logits[:, :-1, :].contiguous()  # (B, T-1, vocab)
-                targets_for_loss = y[:, 1:].contiguous()  # (B, T-1)
-
+                # Loss: logits[i] predicts y[i] (data is already shifted in dataloader)
                 loss = nn.functional.cross_entropy(
-                    logits_for_loss.view(-1, logits_for_loss.size(-1)),
-                    targets_for_loss.view(-1),
+                    logits.view(-1, logits.size(-1)),
+                    y.view(-1),
                 )
 
             # Backward pass
@@ -1501,13 +1496,10 @@ def evaluate_sit(
         with autocast("cuda", dtype=torch.bfloat16):
             logits = model(x)  # (B, T, vocab)
 
-            # Loss: logits[t] predicts y[t+1]
-            logits_for_loss = logits[:, :-1, :].contiguous()
-            targets_for_loss = y[:, 1:].contiguous()
-
+            # Loss: logits[i] predicts y[i] (data is already shifted in dataloader)
             loss = nn.functional.cross_entropy(
-                logits_for_loss.view(-1, logits_for_loss.size(-1)),
-                targets_for_loss.view(-1),
+                logits.view(-1, logits.size(-1)),
+                y.view(-1),
             )
 
         total_loss += loss.item()
