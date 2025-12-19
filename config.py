@@ -394,6 +394,13 @@ class SITConfig:
     fno_lr_mult: float = 1.0  # Multiplier for FNO parameters (try 3-10x)
     spectral_lr_mult: float = 1.0  # Multiplier for spectral projection layers
 
+    # ===========================================================================
+    # Ablation / Debugging
+    # ===========================================================================
+    # Disable spectral injection (compute FNO but don't add to embeddings)
+    # Useful for isolating whether the FNO output is hurting the transformer
+    disable_injection: bool = False
+
     def __post_init__(self):
         # Set defaults based on transformer config
         if self.d_spectral is None:

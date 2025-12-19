@@ -2256,8 +2256,9 @@ class SpectralInjectionTransformer(nn.Module):
             # Add spectral contribution for these positions
             spectral_contrib = spectral_contrib + mask * time_pred
 
-        # Apply gate and add to embeddings
-        h = h + gate * spectral_contrib
+        # Apply gate and add to embeddings (unless injection is disabled)
+        if not self.config.disable_injection:
+            h = h + gate * spectral_contrib
 
         # =====================================================================
         # Transformer Forward (Causal)

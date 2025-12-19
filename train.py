@@ -1781,6 +1781,11 @@ def main():
         default=1.0,
         help="Learning rate multiplier for spectral projection layers (default: 1.0)",
     )
+    parser.add_argument(
+        "--sit_disable_injection",
+        action="store_true",
+        help="Disable spectral injection (compute FNO but don't add to embeddings). For ablation testing.",
+    )
 
     args = parser.parse_args()
 
@@ -1965,6 +1970,7 @@ def main():
             injection_gate_init=args.sit_injection_gate,
             fno_lr_mult=args.sit_fno_lr_mult,
             spectral_lr_mult=args.sit_spectral_lr_mult,
+            disable_injection=args.sit_disable_injection,
         )
 
         print(f"SIT config: {sit_config.experiment_summary()}")
