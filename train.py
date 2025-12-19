@@ -1265,9 +1265,41 @@ def train_sit(
         num_workers=4,
     )
 
-    # Optimizer
+    # Create parameter groups with different learning rates for FNO/spectral layers
+    # This compensates for the naturally smaller gradients in spectral components
+    fno_params = []
+    spectral_proj_params = []
+    other_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "fno" in name or "injection_gate" in name:
+            fno_params.append(param)
+        elif "spectral_proj" in name:
+            spectral_proj_params.append(param)
+        else:
+            other_params.append(param)
+
+    # Log parameter group sizes
+    print(f"Parameter groups:")
+    print(
+        f"  FNO params: {sum(p.numel() for p in fno_params):,} (lr_mult={sit_config.fno_lr_mult})"
+    )
+    print(
+        f"  Spectral proj params: {sum(p.numel() for p in spectral_proj_params):,} (lr_mult={sit_config.spectral_lr_mult})"
+    )
+    print(f"  Other params: {sum(p.numel() for p in other_params):,} (lr_mult=1.0)")
+
+    param_groups = [
+        {"params": other_params, "lr_mult": 1.0},
+        {"params": fno_params, "lr_mult": sit_config.fno_lr_mult},
+        {"params": spectral_proj_params, "lr_mult": sit_config.spectral_lr_mult},
+    ]
+
+    # Optimizer with parameter groups
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        param_groups,
         lr=train_config.lr,
         betas=(train_config.beta1, train_config.beta2),
         weight_decay=train_config.weight_decay,
@@ -1303,10 +1335,11 @@ def train_sit(
             x, y = x.to(device), y.to(device)
             batch_start_time = time.time()
 
-            # Update learning rate
-            lr = get_lr(global_step, train_config, total_steps)
+            # Update learning rate (with per-group multipliers for FNO/spectral)
+            base_lr = get_lr(global_step, train_config, total_steps)
             for param_group in optimizer.param_groups:
-                param_group["lr"] = lr
+                # Apply the lr_mult stored in each param group
+                param_group["lr"] = base_lr * param_group.get("lr_mult", 1.0)
 
             optimizer.zero_grad()
 
@@ -1359,7 +1392,7 @@ def train_sit(
                     "loss": f"{loss.item():.4f}",
                     "avg_loss": f"{epoch_loss / (batch_idx + 1):.4f}",
                     "tok/s": f"{avg_tokens_per_sec:.0f}",
-                    "lr": f"{lr:.2e}",
+                    "lr": f"{base_lr:.2e}",
                     "eta": eta_str,
                 }
             )
@@ -1367,8 +1400,14 @@ def train_sit(
             # Log to TensorBoard
             if global_step % 10 == 0:
                 logger.log_scalar("train/loss", loss.item(), global_step)
-                logger.log_scalar("train/lr", lr, global_step)
+                logger.log_scalar("train/lr", base_lr, global_step)
                 logger.log_scalar("train/tokens_per_sec", avg_tokens_per_sec, global_step)
+
+                # Log per-group learning rates
+                fno_lr = base_lr * sit_config.fno_lr_mult
+                spectral_lr = base_lr * sit_config.spectral_lr_mult
+                logger.log_scalar("train/lr_fno", fno_lr, global_step)
+                logger.log_scalar("train/lr_spectral", spectral_lr, global_step)
 
                 # Log gradient norms
                 grad_norms = collect_gradient_norms(model)
@@ -1730,6 +1769,18 @@ def main():
         default=-2.0,
         help="Initial value for injection gate (sigmoid applied, default: -2.0 gives ~0.12)",
     )
+    parser.add_argument(
+        "--sit_fno_lr_mult",
+        type=float,
+        default=1.0,
+        help="Learning rate multiplier for FNO parameters (default: 1.0, try 3-10x to boost FNO gradients)",
+    )
+    parser.add_argument(
+        "--sit_spectral_lr_mult",
+        type=float,
+        default=1.0,
+        help="Learning rate multiplier for spectral projection layers (default: 1.0)",
+    )
 
     args = parser.parse_args()
 
@@ -1912,6 +1963,8 @@ def main():
             n_fno_layers=args.sit_n_fno_layers,
             k_max=args.sit_k_max,
             injection_gate_init=args.sit_injection_gate,
+            fno_lr_mult=args.sit_fno_lr_mult,
+            spectral_lr_mult=args.sit_spectral_lr_mult,
         )
 
         print(f"SIT config: {sit_config.experiment_summary()}")

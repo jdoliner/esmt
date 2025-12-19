@@ -385,6 +385,15 @@ class SITConfig:
     # Lower values = less spectral influence at init
     injection_gate_init: float = -2.0  # sigmoid(-2) ≈ 0.12
 
+    # ===========================================================================
+    # Learning Rate Multipliers
+    # ===========================================================================
+    # Separate learning rate multiplier for FNO/spectral parameters
+    # Higher values compensate for naturally smaller gradients in spectral layers
+    # The FNO layers typically see gradients ~100x smaller than transformer layers
+    fno_lr_mult: float = 1.0  # Multiplier for FNO parameters (try 3-10x)
+    spectral_lr_mult: float = 1.0  # Multiplier for spectral projection layers
+
     def __post_init__(self):
         # Set defaults based on transformer config
         if self.d_spectral is None:
