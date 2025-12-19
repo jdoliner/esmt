@@ -1701,10 +1701,16 @@ def main():
         help="Train Spectral Injection Transformer (SIT) model",
     )
     parser.add_argument(
+        "--sit_num_cutoffs",
+        type=int,
+        default=3,
+        help="Number of cutoff points for spectral injection (default: 3, gives cutoffs at 128, 256, 384 for seq_len=512)",
+    )
+    parser.add_argument(
         "--sit_d_spectral",
         type=int,
         default=None,
-        help="SIT spectral dimension (default: d_model // 4)",
+        help="SIT spectral dimension (default: d_model)",
     )
     parser.add_argument(
         "--sit_n_fno_layers",
@@ -1716,7 +1722,7 @@ def main():
         "--sit_k_max",
         type=int,
         default=None,
-        help="Number of frequency modes for SIT (default: seq_len // 16)",
+        help="Number of frequency modes for SIT (default: seq_len // 8)",
     )
     parser.add_argument(
         "--sit_injection_gate",
@@ -1901,6 +1907,7 @@ def main():
             d_model=args.d_model,
             n_layers=args.n_layers,
             seq_len=512,  # Match TinyStories default
+            num_cutoffs=args.sit_num_cutoffs,
             d_spectral=args.sit_d_spectral,
             n_fno_layers=args.sit_n_fno_layers,
             k_max=args.sit_k_max,

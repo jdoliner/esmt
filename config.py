@@ -327,21 +327,24 @@ class SATConfig:
 class SITConfig:
     """Configuration for the Spectral Injection Transformer (SIT).
 
-    This model uses FFT/iFFT to cleanly separate spectral and time-domain processing:
-    - Cumulative FFT converts token embeddings to spectral domain
-    - FNO processes spectral representations
-    - iFFT converts back to time domain
-    - Spectral predictions are injected into transformer input
-    - Bidirectional attention (no causal mask) since causality is enforced
-      by zeroing out future token embeddings
+    This model injects spectral predictions at a small number of cutoff points,
+    rather than at every position. This dramatically reduces memory while still
+    providing long-range spectral signal to guide the transformer.
 
-    Key insight: The iFFT of FNO output contains predictions for ALL positions,
-    including future ones. These predictions are derived only from past tokens
-    (via cumulative FFT), so attending to them doesn't violate causality.
+    Architecture:
+    1. Standard causal transformer processes tokens normally
+    2. At each cutoff point c, compute FFT of tokens [0:c] -> FNO -> predictions
+    3. For positions after cutoff c, add spectral predictions to embeddings
+    4. Each position sees spectral signal only from the most recent cutoff
 
-    MEMORY WARNING: This architecture has O(B * T^2 * D) memory for the transformer
-    input and O(B * T^3 * heads) for attention scores. For seq_len=512, batch_size=4,
-    this requires ~40GB+ GPU memory. Use smaller seq_len (128-256) for experimentation.
+    Example with num_cutoffs=3, seq_len=512:
+    - Cutoff positions: [128, 256, 384]
+    - Positions 0-127: No spectral signal (standard transformer)
+    - Positions 128-255: See FFT[0:128] -> FNO predictions
+    - Positions 256-383: See FFT[0:256] -> FNO predictions
+    - Positions 384-511: See FFT[0:384] -> FNO predictions
+
+    Memory: O(B * T * D) instead of O(B * T^2 * D) - same as standard transformer!
     """
 
     # ===========================================================================
@@ -359,9 +362,9 @@ class SITConfig:
     # ===========================================================================
     # Spectral Stream (FNO) Configuration
     # ===========================================================================
-    d_spectral: int | None = None  # Spectral dimension (default: d_model // 4)
+    d_spectral: int | None = None  # Spectral dimension (default: d_model)
     n_fno_layers: int | None = None  # Number of FNO layers (default: n_layers // 2)
-    k_max: int | None = None  # Number of frequency modes (default: seq_len // 16)
+    k_max: int | None = None  # Number of frequency modes (default: seq_len // 8)
 
     # FNO activation function
     fno_activation: Literal["modrelu", "modsoftplus", "modelu"] = "modsoftplus"
@@ -371,23 +374,25 @@ class SITConfig:
     fno_gate_init: float = 2.0
 
     # ===========================================================================
-    # Injection Configuration
+    # Sparse Cutoff Configuration
     # ===========================================================================
+    # Number of cutoff points for spectral injection
+    # Cutoffs are evenly spaced: seq_len * i / (num_cutoffs + 1) for i in 1..num_cutoffs
+    # Example: num_cutoffs=3, seq_len=512 -> cutoffs at [128, 256, 384]
+    num_cutoffs: int = 3
+
     # Gate initialization for spectral injection (sigmoid applied)
     # Lower values = less spectral influence at init
     injection_gate_init: float = -2.0  # sigmoid(-2) ≈ 0.12
 
-    # Whether to include positional embeddings in future (zeroed) token slots
-    include_future_pos_emb: bool = True
-
     def __post_init__(self):
         # Set defaults based on transformer config
         if self.d_spectral is None:
-            self.d_spectral = self.d_model // 4
+            self.d_spectral = self.d_model
         if self.n_fno_layers is None:
             self.n_fno_layers = max(2, self.n_layers // 2)
         if self.k_max is None:
-            self.k_max = self.seq_len // 16
+            self.k_max = self.seq_len // 8
 
         # Validations
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
@@ -395,17 +400,28 @@ class SITConfig:
         assert self.n_fno_layers > 0, "n_fno_layers must be positive"
         assert self.k_max > 0, "k_max must be positive"
         assert self.seq_len & (self.seq_len - 1) == 0, "seq_len should be power of 2"
+        assert self.num_cutoffs > 0, "num_cutoffs must be positive"
 
     @property
     def head_dim(self) -> int:
         return self.d_model // self.n_heads
 
+    def get_cutoff_positions(self) -> list[int]:
+        """Compute cutoff positions based on num_cutoffs and seq_len.
+
+        Returns evenly spaced positions: seq_len * i / (num_cutoffs + 1) for i in 1..num_cutoffs
+
+        Example: num_cutoffs=3, seq_len=512 -> [128, 256, 384]
+        """
+        return [self.seq_len * i // (self.num_cutoffs + 1) for i in range(1, self.num_cutoffs + 1)]
+
     def experiment_summary(self) -> str:
         """Return a summary of configuration."""
+        cutoffs = self.get_cutoff_positions()
         return (
             f"SIT(d={self.d_model}, d_spec={self.d_spectral}, "
             f"layers={self.n_layers}, fno={self.n_fno_layers}, "
-            f"k_max={self.k_max})"
+            f"k_max={self.k_max}, cutoffs={cutoffs})"
         )
 
 

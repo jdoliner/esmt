@@ -1873,16 +1873,16 @@ def count_parameters(model: nn.Module) -> int:
 
 
 # ==============================================================================
-# Spectral Injection Transformer (SIT)
+# Spectral Injection Transformer (SIT) - Sparse Cutoff Version
 # ==============================================================================
 
 
-class BidirectionalSelfAttention(nn.Module):
+class CausalSelfAttention(nn.Module):
     """
-    Standard self-attention without causal masking.
+    Standard causal self-attention (same as NanoGPT).
 
-    Used in SIT where causality is enforced by zeroing future token embeddings,
-    not by masking attention.
+    Used in SIT with sparse cutoffs, which uses a standard causal transformer
+    augmented with spectral predictions at fixed cutoff points.
     """
 
     def __init__(self, config: SITConfig):
@@ -1916,9 +1916,8 @@ class BidirectionalSelfAttention(nn.Module):
         k = k.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Use scaled_dot_product_attention for memory efficiency (Flash Attention)
-        # No causal mask for bidirectional attention
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        # Use scaled_dot_product_attention with causal mask (Flash Attention)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         # Reshape and project
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, d_model)
@@ -1927,11 +1926,11 @@ class BidirectionalSelfAttention(nn.Module):
         return out
 
 
-class BidirectionalTransformerBlock(nn.Module):
+class CausalTransformerBlock(nn.Module):
     """
-    Standard transformer block with bidirectional attention.
+    Standard causal transformer block.
 
-    Uses pre-norm architecture with standard LayerNorm (no AdaLN).
+    Uses pre-norm architecture with standard LayerNorm.
     """
 
     def __init__(self, config: SITConfig):
@@ -1943,7 +1942,7 @@ class BidirectionalTransformerBlock(nn.Module):
         self.ln2 = nn.LayerNorm(config.d_model, eps=config.eps)
 
         # Attention
-        self.attn = BidirectionalSelfAttention(config)
+        self.attn = CausalSelfAttention(config)
 
         # MLP
         hidden_dim = config.d_model * config.mlp_ratio
@@ -1970,32 +1969,27 @@ class BidirectionalTransformerBlock(nn.Module):
 
 class SpectralInjectionTransformer(nn.Module):
     """
-    Spectral Injection Transformer (SIT).
+    Spectral Injection Transformer (SIT) with Sparse Cutoffs.
 
-    Architecture that cleanly separates spectral and time-domain processing:
+    This model injects spectral predictions at a small number of cutoff points,
+    rather than at every position. This provides long-range spectral signal
+    while maintaining O(B * T * D) memory - same as a standard transformer.
 
-    1. Token embeddings are transformed to spectral domain via cumulative FFT
-    2. FNO processes spectral representations
-    3. iFFT converts back to time domain, producing predictions for ALL positions
-    4. Spectral predictions are injected into transformer input
-    5. Bidirectional transformer processes the combined representation
+    Architecture:
+    1. Compute token + positional embeddings as usual
+    2. At each cutoff point c, compute: FFT[0:c] -> FNO -> iFFT -> predictions
+    3. For positions >= c, add the spectral predictions to their embeddings
+    4. Each position sees only the most recent cutoff's spectral signal
+    5. Standard causal transformer processes the augmented embeddings
 
-    Key insight: For position t, the iFFT output contains predictions for positions
-    [0, 1, ..., L-1], but these predictions are derived ONLY from tokens [0:t+1]
-    (via cumulative FFT). So attending to "future" positions doesn't leak information.
+    Example with num_cutoffs=3, seq_len=512 (cutoffs at [128, 256, 384]):
+    - Position 130 sees: tok_emb[130] + pos_emb[130] + spectral_from_FFT[0:128]
+    - Position 260 sees: tok_emb[260] + pos_emb[260] + spectral_from_FFT[0:256]
+    - Position 100 sees: tok_emb[100] + pos_emb[100] (no spectral, before first cutoff)
 
-    Causality is enforced by:
-    - Zeroing out token embeddings for future positions (they haven't been observed)
-    - Keeping positional embeddings + spectral predictions for future positions
-    - Using bidirectional attention (no causal mask)
-
-    Training produces (B, T, L, D) intermediate tensor:
-    - B: batch size
-    - T: source position (which cumulative FFT)
-    - L: sequence length (full transformer input)
-    - D: model dimension
-
-    Loss is computed at position t+1 of each row t.
+    Key insight: The FNO captures long-range dependencies much better than running
+    it for every position. Running it 3 times is almost as informative since the
+    inputs to the FNO are similar for nearby positions anyway.
     """
 
     def __init__(self, config: SITConfig):
@@ -2007,6 +2001,9 @@ class SpectralInjectionTransformer(nn.Module):
         assert config.n_fno_layers is not None
         assert config.k_max is not None
 
+        # Compute cutoff positions
+        self.cutoff_positions = config.get_cutoff_positions()
+
         # =====================================================================
         # Embeddings
         # =====================================================================
@@ -2014,19 +2011,13 @@ class SpectralInjectionTransformer(nn.Module):
         self.pos_emb = nn.Embedding(config.seq_len, config.d_model)
 
         # =====================================================================
-        # Spectral Stream
+        # Spectral Stream (shared across all cutoffs)
         # =====================================================================
 
         # Project to spectral dimension
         self.spectral_proj_in = nn.Linear(config.d_model, config.d_spectral)
 
-        # Cumulative FFT and inverse
-        self.cumulative_fft = CumulativeFFT(config.seq_len, config.k_max, normalization="position")
-        self.cumulative_ifft = CumulativeIFFT(
-            config.seq_len, config.k_max, normalization="position"
-        )
-
-        # FNO blocks
+        # FNO blocks (process spectral representations)
         self.fno_blocks = nn.ModuleList(
             [
                 FNOBlock(
@@ -2049,18 +2040,136 @@ class SpectralInjectionTransformer(nn.Module):
         )
 
         # =====================================================================
-        # Transformer (Bidirectional)
+        # Transformer (Causal)
         # =====================================================================
         self.blocks = nn.ModuleList(
-            [BidirectionalTransformerBlock(config) for _ in range(config.n_layers)]
+            [CausalTransformerBlock(config) for _ in range(config.n_layers)]
         )
 
         # Final layer norm and output projection
         self.ln_f = nn.LayerNorm(config.d_model, eps=config.eps)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
+        # Precompute FFT twiddle factors for each cutoff position
+        # This allows efficient FFT computation at specific positions
+        self._precompute_fft_twiddles()
+
         # Initialize weights
         self.apply(self._init_weights)
+
+    def _precompute_fft_twiddles(self) -> None:
+        """Precompute FFT twiddle factors for each cutoff position."""
+        assert self.config.k_max is not None, "k_max must be set"
+        k_max = self.config.k_max
+        seq_len = self.config.seq_len
+
+        # For each cutoff c, we need twiddles for positions [0:c]
+        # twiddles[n, k] = e^{-2*pi*i*k*n/seq_len}
+        # We compute these with respect to full seq_len for consistent frequency bins
+        n = torch.arange(seq_len, dtype=torch.float32)
+        k = torch.arange(k_max, dtype=torch.float32)
+        angles = -2 * math.pi * torch.outer(n, k) / seq_len
+
+        twiddles_real = torch.cos(angles).to(torch.bfloat16)
+        twiddles_imag = torch.sin(angles).to(torch.bfloat16)
+        twiddles = torch.stack([twiddles_real, twiddles_imag], dim=-1)  # (seq_len, k_max, 2)
+
+        self.register_buffer("fft_twiddles", twiddles)
+        self.fft_twiddles: torch.Tensor
+
+        # Inverse twiddles for iFFT
+        inv_angles = 2 * math.pi * torch.outer(n, k) / seq_len
+        inv_twiddles_real = torch.cos(inv_angles).to(torch.bfloat16)
+        inv_twiddles_imag = torch.sin(inv_angles).to(torch.bfloat16)
+        inv_twiddles = torch.stack([inv_twiddles_real, inv_twiddles_imag], dim=-1)
+
+        self.register_buffer("ifft_twiddles", inv_twiddles)
+        self.ifft_twiddles: torch.Tensor
+
+    def _compute_fft_at_cutoff(self, h_spectral: torch.Tensor, cutoff: int) -> torch.Tensor:
+        """
+        Compute FFT of tokens [0:cutoff] (exclusive).
+
+        Args:
+            h_spectral: Spectral embeddings (batch, seq_len, d_spectral) in bfloat16
+            cutoff: Cutoff position (exclusive)
+
+        Returns:
+            Complex FFT output (batch, d_spectral, k_max, 2)
+        """
+        batch, seq_len, d_spectral = h_spectral.shape
+        assert self.config.k_max is not None
+        k_max = self.config.k_max
+
+        # Get embeddings for positions [0:cutoff]
+        h_cut = h_spectral[:, :cutoff, :]  # (B, cutoff, d_spectral)
+
+        # Get twiddles for positions [0:cutoff]
+        twiddles = self.fft_twiddles[:cutoff]  # (cutoff, k_max, 2)
+
+        # Compute FFT: X[k] = sum_n x[n] * e^{-2*pi*i*k*n/N}
+        # h_cut: (B, cutoff, d_spectral)
+        # twiddles: (cutoff, k_max, 2)
+        # Output: (B, d_spectral, k_max, 2)
+
+        # Use einsum for clarity
+        # h_cut[b, n, d] * twiddles[n, k, (real/imag)]
+        # -> sum over n -> (B, d_spectral, k_max)
+
+        # Real part of FFT: sum_n h[n] * cos(angle[n,k])
+        # Imag part of FFT: sum_n h[n] * sin(angle[n,k])
+        twiddles_real = twiddles[..., 0]  # (cutoff, k_max)
+        twiddles_imag = twiddles[..., 1]  # (cutoff, k_max)
+
+        # Einsum: b=batch, n=position, d=d_spectral, k=frequency
+        # h_cut: (b, n, d), twiddles: (n, k) -> (b, d, k)
+        fft_real = torch.einsum("bnd,nk->bdk", h_cut, twiddles_real)
+        fft_imag = torch.einsum("bnd,nk->bdk", h_cut, twiddles_imag)
+
+        # Normalize by sqrt(cutoff) for stable magnitudes
+        norm = math.sqrt(cutoff)
+        fft_real = fft_real / norm
+        fft_imag = fft_imag / norm
+
+        return torch.stack([fft_real, fft_imag], dim=-1)  # (B, d_spectral, k_max, 2)
+
+    def _compute_ifft(self, spectral: torch.Tensor) -> torch.Tensor:
+        """
+        Compute inverse FFT to get time-domain predictions for all positions.
+
+        Args:
+            spectral: Complex spectral representation (batch, d_spectral, k_max, 2)
+
+        Returns:
+            Real time-domain predictions (batch, seq_len, d_spectral)
+        """
+        batch, d_spectral, k_max, _ = spectral.shape
+        seq_len = self.config.seq_len
+
+        # inv_twiddles: (seq_len, k_max, 2)
+        # spectral: (B, d_spectral, k_max, 2)
+        # Output: (B, seq_len, d_spectral)
+
+        # iFFT: x[n] = sum_k X[k] * e^{+2*pi*i*k*n/N}
+        # Complex multiplication: (X_r + i*X_i) * (cos + i*sin) = (X_r*cos - X_i*sin) + i*(...)
+        # We only need the real part for output
+
+        s_real = spectral[..., 0]  # (B, d_spectral, k_max)
+        s_imag = spectral[..., 1]
+        t_real = self.ifft_twiddles[..., 0]  # (seq_len, k_max)
+        t_imag = self.ifft_twiddles[..., 1]
+
+        # Real part of iFFT output: sum_k (X_r * cos - X_i * sin)
+        # Using einsum: b=batch, d=d_spectral, k=frequency, n=position
+        # s_real: (b, d, k), t_real: (n, k) -> (b, n, d)
+        output_real_part1 = torch.einsum("bdk,nk->bnd", s_real, t_real)
+        output_real_part2 = torch.einsum("bdk,nk->bnd", s_imag, t_imag)
+        output_real = output_real_part1 - output_real_part2
+
+        # Normalize by seq_len (standard iFFT normalization)
+        output_real = output_real / seq_len
+
+        return output_real
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -2082,8 +2191,6 @@ class SpectralInjectionTransformer(nn.Module):
 
         Returns:
             logits: Output logits (batch, seq_len, vocab_size)
-                   Loss should be computed comparing logits[t] to target[t+1]
-                   for t in [0, seq_len-2]
         """
         batch, seq_len = x.shape
         device = x.device
@@ -2096,135 +2203,71 @@ class SpectralInjectionTransformer(nn.Module):
         pos = torch.arange(seq_len, device=device)
         pos_emb = self.pos_emb(pos)  # (T, D)
 
-        # Full embeddings for observed tokens
+        # Base embeddings
         h = tok_emb + pos_emb  # (B, T, D)
 
         # =====================================================================
-        # Spectral Stream: FFT -> FNO -> iFFT
+        # Spectral Injection at Cutoff Points
         # =====================================================================
 
-        # Project to spectral dimension
-        h_spectral = self.spectral_proj_in(h)  # (B, T, D_spec)
-        h_spectral = h_spectral.to(torch.bfloat16)
+        # Project to spectral dimension for FFT
+        h_spectral = self.spectral_proj_in(h).to(torch.bfloat16)  # (B, T, D_spec)
 
-        # Cumulative FFT
-        spectral = self.cumulative_fft(h_spectral)  # (B, T, D_spec, K, 2)
-
-        # FNO processing
-        for fno_block in self.fno_blocks:
-            spectral = fno_block(spectral)
-
-        # Inverse FFT to get time-domain predictions
-        # Output: (B, T, seq_len, D_spec)
-        # For each source position t, we get predictions for all target positions
-        spectral_time = self.cumulative_ifft(spectral)
-
-        # Project back to model dimension (keep in bfloat16)
-        spectral_pred = self.spectral_proj_out(spectral_time)  # (B, T, seq_len, D)
-
-        # Apply injection gate
+        # Compute injection gate
         gate = torch.sigmoid(self.injection_gate)
-        spectral_pred = gate * spectral_pred
 
-        # =====================================================================
-        # Construct Transformer Input for Each Position
-        # =====================================================================
+        # Initialize spectral contribution as zeros
+        spectral_contrib = torch.zeros_like(h)  # (B, T, D)
 
-        # For each source position t, construct a length-seq_len input:
-        # - Positions [0:t+1]: tok_emb + pos_emb + spectral_pred
-        # - Positions [t+1:seq_len]: pos_emb + spectral_pred (token emb zeroed)
+        # Process each cutoff
+        for i, cutoff in enumerate(self.cutoff_positions):
+            if cutoff >= seq_len:
+                continue  # Skip cutoffs beyond current sequence length
 
-        # Create causal mask: (T, seq_len) where mask[t, t'] = 1 if t' <= t
-        t_indices = torch.arange(seq_len, device=device).unsqueeze(1)  # (T, 1)
-        tp_indices = torch.arange(seq_len, device=device).unsqueeze(0)  # (1, seq_len)
-        causal_mask = (tp_indices <= t_indices).to(tok_emb.dtype)  # (T, seq_len)
+            # Compute FFT of tokens [0:cutoff]
+            fft_out = self._compute_fft_at_cutoff(h_spectral, cutoff)  # (B, d_spectral, k_max, 2)
 
-        # Expand embeddings for the (B, T, seq_len, D) construction
-        # tok_emb: (B, T, D) -> need (B, T, seq_len, D)
-        # But tok_emb[t'] should only appear when t' <= t
+            # Process through FNO
+            # Reshape to (B, 1, d_spectral, k_max, 2) for FNO blocks
+            spectral = fft_out.unsqueeze(1)
+            for fno_block in self.fno_blocks:
+                spectral = fno_block(spectral)
+            spectral = spectral.squeeze(1)  # (B, d_spectral, k_max, 2)
 
-        # Create the token embedding contribution
-        # For position (t, t'), include tok_emb[t'] only if t' <= t
-        tok_emb_expanded = tok_emb.unsqueeze(1).expand(
-            batch, seq_len, seq_len, self.config.d_model
-        )  # (B, T, seq_len, D) - but this has tok_emb repeated wrong
+            # Inverse FFT to get time-domain predictions
+            time_pred = self._compute_ifft(spectral)  # (B, seq_len, d_spectral)
 
-        # Actually we need: for each t, the token embeddings are [tok_0, ..., tok_t, 0, ..., 0]
-        # This requires gathering or masking
+            # Project back to model dimension
+            time_pred = self.spectral_proj_out(time_pred.float())  # (B, seq_len, D)
 
-        # Simpler approach: create (B, seq_len, seq_len, D) then mask
-        # tok_contrib[b, t, t', d] = tok_emb[b, t', d] if t' <= t else 0
-
-        # Expand tok_emb to (B, 1, seq_len, D) and broadcast
-        tok_emb_for_mask = tok_emb.unsqueeze(1)  # (B, 1, T, D)
-        # Expand to (B, T, seq_len, D)
-        tok_emb_expanded = tok_emb_for_mask.expand(batch, seq_len, seq_len, -1)
-        # Apply causal mask: (T, seq_len) -> (1, T, seq_len, 1)
-        tok_emb_masked = tok_emb_expanded * causal_mask.unsqueeze(0).unsqueeze(-1)
-
-        # Positional embeddings: always included for all positions
-        # pos_emb: (seq_len, D) -> (1, 1, seq_len, D)
-        pos_emb_expanded = pos_emb.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, D)
-
-        # Combine: tok_emb (masked) + pos_emb + spectral_pred
-        # spectral_pred: (B, T, seq_len, D)
-        transformer_input = tok_emb_masked + pos_emb_expanded + spectral_pred
-        # Shape: (B, T, seq_len, D)
-
-        # =====================================================================
-        # Transformer Forward (Bidirectional)
-        # =====================================================================
-
-        # Reshape for efficient batch processing: (B*T, seq_len, D)
-        transformer_input = transformer_input.view(batch * seq_len, seq_len, -1)
-
-        # Run through transformer blocks
-        # Note: gradient checkpointing can help with memory but we need to be careful
-        # since (B*T, T, D) is already very large
-        h = transformer_input
-        for block in self.blocks:
-            if (
-                self.training
-                and hasattr(self, "use_gradient_checkpointing")
-                and self.use_gradient_checkpointing
-            ):
-                h = grad_checkpoint(block, h, use_reentrant=False)
+            # Determine which positions receive this spectral signal
+            # Positions in [cutoff, next_cutoff) should use this prediction
+            if i + 1 < len(self.cutoff_positions):
+                next_cutoff = self.cutoff_positions[i + 1]
             else:
-                h = block(h)
+                next_cutoff = seq_len
 
-        # Final layer norm
-        h = self.ln_f(h)  # (B*T, seq_len, d_model)
+            # Create mask for positions [cutoff, next_cutoff)
+            # Shape: (1, seq_len, 1) for broadcasting
+            pos_indices = torch.arange(seq_len, device=device)
+            mask = ((pos_indices >= cutoff) & (pos_indices < next_cutoff)).float()
+            mask = mask.view(1, seq_len, 1)  # (1, T, 1)
+
+            # Add spectral contribution for these positions
+            spectral_contrib = spectral_contrib + mask * time_pred
+
+        # Apply gate and add to embeddings
+        h = h + gate * spectral_contrib
 
         # =====================================================================
-        # Extract Only Needed Hidden States Before lm_head
+        # Transformer Forward (Causal)
         # =====================================================================
-        # We only need predictions at position t+1 for each source position t.
-        # Instead of computing (B*T, seq_len, vocab) and then gathering,
-        # we first gather the hidden states, then project to vocab.
-        # This reduces memory from O(B*T*T*vocab) to O(B*T*vocab).
 
-        # Reshape h: (B*T, seq_len, d_model) -> (B, T, seq_len, d_model)
-        h = h.view(batch, seq_len, seq_len, -1)
+        for block in self.blocks:
+            h = block(h)
 
-        # For source position t, we want the hidden state at target position t+1
-        # This is h[b, t, t+1, :] for t in [0, T-2]
-        # And h[b, T-1, T-1, :] for t = T-1 (placeholder, predicts nothing)
+        # Final layer norm and output projection
+        h = self.ln_f(h)
+        logits = self.lm_head(h)  # (B, T, vocab)
 
-        # Create indices for gathering the diagonal+1
-        t_indices = torch.arange(seq_len - 1, device=device)  # [0, 1, ..., T-2]
-        tp1_indices = t_indices + 1  # [1, 2, ..., T-1]
-
-        # Gather hidden states: h[b, t, t+1, :] for t in [0, T-2]
-        # Shape: (B, T-1, d_model)
-        next_hidden = h[:, t_indices, tp1_indices, :]  # (B, T-1, d_model)
-
-        # For the last position, use hidden state at (T-1, T-1)
-        last_hidden = h[:, -1, -1, :].unsqueeze(1)  # (B, 1, d_model)
-
-        # Concatenate to get (B, T, d_model)
-        output_hidden = torch.cat([next_hidden, last_hidden], dim=1)
-
-        # NOW project to vocab - this is only (B, T, vocab) instead of (B*T, T, vocab)
-        output_logits = self.lm_head(output_hidden)  # (B, T, vocab)
-
-        return output_logits
+        return logits
