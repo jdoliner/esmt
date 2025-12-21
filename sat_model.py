@@ -2195,6 +2195,9 @@ class SpectralInjectionTransformer(nn.Module):
         batch, seq_len = x.shape
         device = x.device
 
+        # Determine injection layer (0 = before first transformer layer, i.e. into embeddings)
+        injection_layer = self.config.injection_layer or 0
+
         # =====================================================================
         # Embeddings
         # =====================================================================
@@ -2207,9 +2210,38 @@ class SpectralInjectionTransformer(nn.Module):
         h = tok_emb + pos_emb  # (B, T, D)
 
         # =====================================================================
-        # Spectral Injection at Cutoff Points
+        # Transformer Forward with Spectral Injection
         # =====================================================================
 
+        for layer_idx, block in enumerate(self.blocks):
+            # Inject spectral signal before the designated layer
+            if layer_idx == injection_layer and not self.config.disable_injection:
+                h = self._inject_spectral(h, seq_len, device)
+
+            h = block(h)
+
+        # Handle injection after all layers (injection_layer == n_layers)
+        if injection_layer == len(self.blocks) and not self.config.disable_injection:
+            h = self._inject_spectral(h, seq_len, device)
+
+        # Final layer norm and output projection
+        h = self.ln_f(h)
+        logits = self.lm_head(h)  # (B, T, vocab)
+
+        return logits
+
+    def _inject_spectral(self, h: torch.Tensor, seq_len: int, device: torch.device) -> torch.Tensor:
+        """
+        Compute and inject spectral signal into hidden states.
+
+        Args:
+            h: Hidden states (batch, seq_len, d_model)
+            seq_len: Sequence length
+            device: Device
+
+        Returns:
+            Hidden states with spectral signal added
+        """
         # Project to spectral dimension for FFT
         h_spectral = self.spectral_proj_in(h).to(torch.bfloat16)  # (B, T, D_spec)
 
@@ -2256,19 +2288,5 @@ class SpectralInjectionTransformer(nn.Module):
             # Add spectral contribution for these positions
             spectral_contrib = spectral_contrib + mask * time_pred
 
-        # Apply gate and add to embeddings (unless injection is disabled)
-        if not self.config.disable_injection:
-            h = h + gate * spectral_contrib
-
-        # =====================================================================
-        # Transformer Forward (Causal)
-        # =====================================================================
-
-        for block in self.blocks:
-            h = block(h)
-
-        # Final layer norm and output projection
-        h = self.ln_f(h)
-        logits = self.lm_head(h)  # (B, T, vocab)
-
-        return logits
+        # Apply gate and add to hidden states
+        return h + gate * spectral_contrib

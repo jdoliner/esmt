@@ -1778,6 +1778,13 @@ def main():
         action="store_true",
         help="Disable spectral injection (compute FNO but don't add to embeddings). For ablation testing.",
     )
+    parser.add_argument(
+        "--sit_injection_layer",
+        type=int,
+        default=None,
+        help="Which transformer layer to inject spectral signal before (default: 0 = into embeddings). "
+        "Higher values = shorter gradient path. For 6 layers, try 3 or 4.",
+    )
 
     args = parser.parse_args()
 
@@ -1963,6 +1970,7 @@ def main():
             fno_lr_mult=args.sit_fno_lr_mult,
             spectral_lr_mult=args.sit_spectral_lr_mult,
             disable_injection=args.sit_disable_injection,
+            injection_layer=args.sit_injection_layer,
         )
 
         print(f"SIT config: {sit_config.experiment_summary()}")

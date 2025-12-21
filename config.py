@@ -395,6 +395,16 @@ class SITConfig:
     spectral_lr_mult: float = 1.0  # Multiplier for spectral projection layers
 
     # ===========================================================================
+    # Injection Point Configuration
+    # ===========================================================================
+    # Which transformer layer to inject spectral signal before
+    # None (default) = inject into embeddings before any transformer layers (layer 0)
+    # 0 = same as None (before first transformer layer)
+    # 3 = inject before layer 3 (after layers 0, 1, 2 have processed)
+    # This controls the gradient path length - higher values = shorter path to loss
+    injection_layer: int | None = None
+
+    # ===========================================================================
     # Ablation / Debugging
     # ===========================================================================
     # Disable spectral injection (compute FNO but don't add to embeddings)
@@ -417,6 +427,10 @@ class SITConfig:
         assert self.k_max > 0, "k_max must be positive"
         assert self.seq_len & (self.seq_len - 1) == 0, "seq_len should be power of 2"
         assert self.num_cutoffs > 0, "num_cutoffs must be positive"
+        if self.injection_layer is not None:
+            assert 0 <= self.injection_layer <= self.n_layers, (
+                f"injection_layer must be in [0, {self.n_layers}], got {self.injection_layer}"
+            )
 
     @property
     def head_dim(self) -> int:
