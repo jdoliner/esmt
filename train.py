@@ -414,6 +414,9 @@ def train_model(
     model_config: ESMTConfig | NanoGPTConfig | ComplexESMTConfig,
     model_name: str,
     use_matryoshka: bool = True,
+    dataset: str = "tinystories",
+    max_books: int | None = None,
+    stride: int | None = None,
 ) -> nn.Module:
     """
     Train a model with optional Matryoshka loss.
@@ -424,6 +427,9 @@ def train_model(
         model_config: Model configuration
         model_name: Name for logging/checkpointing
         use_matryoshka: Whether to use Matryoshka dual-loss training
+        dataset: Dataset to use ("tinystories" or "pg19")
+        max_books: Maximum number of books for PG-19 (None = all)
+        stride: Stride for PG-19 chunking (None = seq_len, non-overlapping)
 
     Returns:
         Trained model
@@ -446,19 +452,38 @@ def train_model(
     elif is_complex_model and train_config.compile_model:
         print("Skipping torch.compile for complex model (limited complex op support)")
 
-    # Create data loaders
-    train_loader = create_dataloader(
-        split="train",
-        seq_len=model_config.seq_len,
-        batch_size=train_config.batch_size,
-        num_workers=4,
-    )
-    val_loader = create_dataloader(
-        split="validation",
-        seq_len=model_config.seq_len,
-        batch_size=train_config.batch_size,
-        num_workers=4,
-    )
+    # Create data loaders based on dataset choice
+    print(f"Using dataset: {dataset}, seq_len: {model_config.seq_len}")
+    if dataset == "pg19":
+        train_loader = create_pg19_dataloader(
+            split="train",
+            seq_len=model_config.seq_len,
+            batch_size=train_config.batch_size,
+            num_workers=4,
+            max_books=max_books,
+            stride=stride,
+        )
+        val_loader = create_pg19_dataloader(
+            split="validation",
+            seq_len=model_config.seq_len,
+            batch_size=train_config.batch_size,
+            num_workers=4,
+            max_books=max_books // 10 if max_books else None,
+            stride=model_config.seq_len,  # Non-overlapping for validation
+        )
+    else:  # tinystories
+        train_loader = create_dataloader(
+            split="train",
+            seq_len=model_config.seq_len,
+            batch_size=train_config.batch_size,
+            num_workers=4,
+        )
+        val_loader = create_dataloader(
+            split="validation",
+            seq_len=model_config.seq_len,
+            batch_size=train_config.batch_size,
+            num_workers=4,
+        )
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -2033,10 +2058,11 @@ def main():
         sit_model = SpectralInjectionTransformer(sit_config)
         print(f"SIT parameters: {format_params(sat_count_parameters(sit_model))}")
 
-        # Also create NanoGPT baseline for comparison
+        # Also create NanoGPT baseline for comparison (with same seq_len)
         nano_config = NanoGPTConfig(
             d_model=args.d_model,
             n_layers=args.n_layers,
+            seq_len=args.seq_len,
         )
         nanogpt_baseline = NanoGPT(nano_config)
         print(f"NanoGPT baseline parameters: {format_params(count_parameters(nanogpt_baseline))}")
@@ -2068,6 +2094,9 @@ def main():
                 nano_config,
                 model_name=nanogpt_run_name,
                 use_matryoshka=False,
+                dataset=args.dataset,
+                max_books=args.max_books,
+                stride=args.stride,
             )
 
         print("\nTraining complete!")
