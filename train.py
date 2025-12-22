@@ -35,6 +35,7 @@ from utils import (
     TensorBoardLogger,
     Timer,
     create_dataloader,
+    create_pg19_dataloader,
     format_params,
     get_device,
     save_checkpoint,
@@ -1223,6 +1224,8 @@ def train_sit(
     train_config: TrainConfig,
     sit_config: SITConfig,
     model_name: str,
+    dataset: str = "tinystories",
+    max_books: int | None = None,
 ) -> SpectralInjectionTransformer:
     """
     Train a Spectral Injection Transformer.
@@ -1236,6 +1239,8 @@ def train_sit(
         train_config: Training configuration
         sit_config: SIT model configuration
         model_name: Name for logging/checkpointing
+        dataset: Dataset to use ("tinystories" or "pg19")
+        max_books: Maximum number of books for PG-19 (None = all)
 
     Returns:
         Trained model
@@ -1251,19 +1256,36 @@ def train_sit(
     # SIT doesn't support torch.compile well due to dynamic shapes
     print("Skipping torch.compile for SIT (dynamic tensor shapes)")
 
-    # Create data loaders
-    train_loader = create_dataloader(
-        split="train",
-        seq_len=sit_config.seq_len,
-        batch_size=train_config.batch_size,
-        num_workers=4,
-    )
-    val_loader = create_dataloader(
-        split="validation",
-        seq_len=sit_config.seq_len,
-        batch_size=train_config.batch_size,
-        num_workers=4,
-    )
+    # Create data loaders based on dataset choice
+    print(f"Using dataset: {dataset}, seq_len: {sit_config.seq_len}")
+    if dataset == "pg19":
+        train_loader = create_pg19_dataloader(
+            split="train",
+            seq_len=sit_config.seq_len,
+            batch_size=train_config.batch_size,
+            num_workers=4,
+            max_books=max_books,
+        )
+        val_loader = create_pg19_dataloader(
+            split="validation",
+            seq_len=sit_config.seq_len,
+            batch_size=train_config.batch_size,
+            num_workers=4,
+            max_books=max_books // 10 if max_books else None,  # Fewer books for validation
+        )
+    else:  # tinystories
+        train_loader = create_dataloader(
+            split="train",
+            seq_len=sit_config.seq_len,
+            batch_size=train_config.batch_size,
+            num_workers=4,
+        )
+        val_loader = create_dataloader(
+            split="validation",
+            seq_len=sit_config.seq_len,
+            batch_size=train_config.batch_size,
+            num_workers=4,
+        )
 
     # Create parameter groups with different learning rates for FNO/spectral layers
     # This compensates for the naturally smaller gradients in spectral components
@@ -1786,6 +1808,27 @@ def main():
         "Higher values = shorter gradient path. For 6 layers, try 3 or 4.",
     )
 
+    # Dataset selection
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["tinystories", "pg19"],
+        default="tinystories",
+        help="Dataset to use for training (default: tinystories). Use pg19 for longer sequences.",
+    )
+    parser.add_argument(
+        "--seq_len",
+        type=int,
+        default=512,
+        help="Sequence length (default: 512). For pg19, try 2048, 4096, or 8192.",
+    )
+    parser.add_argument(
+        "--max_books",
+        type=int,
+        default=None,
+        help="Maximum number of books to load for PG-19 (default: all). Useful for quick testing.",
+    )
+
     args = parser.parse_args()
 
     # Set seed for reproducibility
@@ -1961,7 +2004,7 @@ def main():
         sit_config = SITConfig(
             d_model=args.d_model,
             n_layers=args.n_layers,
-            seq_len=512,  # Match TinyStories default
+            seq_len=args.seq_len,
             num_cutoffs=args.sit_num_cutoffs,
             d_spectral=args.sit_d_spectral,
             n_fno_layers=args.sit_n_fno_layers,
@@ -1997,6 +2040,8 @@ def main():
             train_config,
             sit_config,
             model_name=sit_run_name,
+            dataset=args.dataset,
+            max_books=args.max_books,
         )
 
         # Optionally train baseline for comparison

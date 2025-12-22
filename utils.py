@@ -80,7 +80,7 @@ class TinyStoriesDataset(Dataset):
             self.tokenizer.pad_token = self.tokenizer.eos_token
         else:
             self.tokenizer = tokenizer
-        
+
         # Suppress the "Token indices sequence length is longer than the specified
         # maximum sequence length" warning by setting model_max_length high
         self.tokenizer.model_max_length = 100000
@@ -91,7 +91,7 @@ class TinyStoriesDataset(Dataset):
 
         # Tokenize all texts using multiprocessing
         print(f"Tokenizing {len(dataset)} examples with multiprocessing...")
-        
+
         def tokenize_fn(examples):
             """Batch tokenization function for dataset.map()"""
             tokenized = self.tokenizer(
@@ -101,7 +101,7 @@ class TinyStoriesDataset(Dataset):
                 return_attention_mask=False,
             )
             return {"input_ids": tokenized["input_ids"]}
-        
+
         # Use all available CPU cores for tokenization
         num_proc = os.cpu_count() or 4
         tokenized_dataset = dataset.map(
@@ -112,7 +112,7 @@ class TinyStoriesDataset(Dataset):
             remove_columns=dataset.column_names,
             desc="Tokenizing",
         )
-        
+
         # Filter and concatenate tokens
         all_tokens = []
         skipped = 0
@@ -155,6 +155,133 @@ def create_dataloader(
 ) -> DataLoader:
     """Create a DataLoader for TinyStories."""
     dataset = TinyStoriesDataset(split=split, seq_len=seq_len, tokenizer=tokenizer)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+
+class PG19Dataset(Dataset):
+    """Dataset wrapper for PG-19 (Project Gutenberg long-form books).
+
+    PG-19 contains full books from Project Gutenberg, providing much longer
+    sequences than TinyStories. This is useful for testing long-range
+    dependency modeling.
+    """
+
+    def __init__(
+        self,
+        split: str = "train",
+        seq_len: int = 2048,
+        tokenizer: GPT2TokenizerFast | None = None,
+        max_books: int | None = None,
+    ):
+        """
+        Initialize PG-19 dataset.
+
+        Args:
+            split: Dataset split ('train', 'validation', or 'test')
+            seq_len: Sequence length for chunking (can be much longer than TinyStories)
+            tokenizer: GPT-2 tokenizer (will load default if None)
+            max_books: Maximum number of books to load (None = all). Useful for testing.
+        """
+        self.seq_len = seq_len
+
+        # Load tokenizer
+        if tokenizer is None:
+            self.tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        else:
+            self.tokenizer = tokenizer
+
+        # Suppress the length warning (PG-19 books can be very long)
+        self.tokenizer.model_max_length = 10000000
+
+        # Load PG-19 dataset using streaming to avoid downloading everything at once
+        # Then take only the books we need
+        print(f"Loading PG-19 {split} split (streaming)...")
+        dataset = load_dataset("emozilla/pg19", split=split, streaming=True)
+
+        # Collect books up to max_books
+        books = []
+        for i, example in enumerate(dataset):
+            if max_books is not None and i >= max_books:
+                break
+            books.append(example["text"])
+            if (i + 1) % 100 == 0:
+                print(f"  Loaded {i + 1} books...")
+
+        print(f"Loaded {len(books)} books")
+
+        # Tokenize books
+        print(f"Tokenizing {len(books)} books...")
+
+        all_tokens = []
+        for i, text in enumerate(books):
+            if (i + 1) % 100 == 0 or i == 0:
+                print(f"  Tokenizing book {i + 1}/{len(books)}...")
+
+            # Tokenize the full book text
+            tokens = self.tokenizer.encode(
+                text,
+                add_special_tokens=True,
+            )
+            all_tokens.extend(tokens)
+            # Add EOS token between books to mark boundaries
+            all_tokens.append(self.tokenizer.eos_token_id)
+
+        print(f"Total tokens: {len(all_tokens):,}")
+
+        # Chunk into sequences of seq_len + 1 (for input/target shift)
+        self.chunks = []
+        chunk_size = seq_len + 1
+        for i in range(0, len(all_tokens) - chunk_size + 1, chunk_size):
+            chunk = all_tokens[i : i + chunk_size]
+            self.chunks.append(torch.tensor(chunk, dtype=torch.long))
+
+        print(f"Created {len(self.chunks):,} sequences of length {seq_len}")
+
+    def __len__(self) -> int:
+        return len(self.chunks)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        chunk = self.chunks[idx]
+        x = chunk[:-1]  # Input: all but last token
+        y = chunk[1:]  # Target: all but first token
+        return x, y
+
+
+def create_pg19_dataloader(
+    split: str,
+    seq_len: int,
+    batch_size: int,
+    num_workers: int = 4,
+    tokenizer: GPT2TokenizerFast | None = None,
+    max_books: int | None = None,
+) -> DataLoader:
+    """Create a DataLoader for PG-19.
+
+    Args:
+        split: Dataset split ('train', 'validation', or 'test')
+        seq_len: Sequence length (e.g., 2048, 4096, 8192)
+        batch_size: Batch size
+        num_workers: Number of data loading workers
+        tokenizer: GPT-2 tokenizer (will load default if None)
+        max_books: Maximum number of books to load (None = all)
+
+    Returns:
+        DataLoader for PG-19 dataset
+    """
+    dataset = PG19Dataset(
+        split=split,
+        seq_len=seq_len,
+        tokenizer=tokenizer,
+        max_books=max_books,
+    )
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -328,7 +455,7 @@ def load_checkpoint(
 ) -> dict:
     """Load model checkpoint."""
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    
+
     # Handle state dict from torch.compile() which adds "_orig_mod." prefix
     state_dict = checkpoint["model_state_dict"]
     unwrapped_state_dict = {}
@@ -336,7 +463,7 @@ def load_checkpoint(
         # Strip "_orig_mod." prefix if present
         new_key = key.replace("_orig_mod.", "")
         unwrapped_state_dict[new_key] = value
-    
+
     model.load_state_dict(unwrapped_state_dict)
     if optimizer is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
