@@ -179,6 +179,7 @@ class PG19Dataset(Dataset):
         seq_len: int = 2048,
         tokenizer: GPT2TokenizerFast | None = None,
         max_books: int | None = None,
+        stride: int | None = None,
     ):
         """
         Initialize PG-19 dataset.
@@ -188,8 +189,11 @@ class PG19Dataset(Dataset):
             seq_len: Sequence length for chunking (can be much longer than TinyStories)
             tokenizer: GPT-2 tokenizer (will load default if None)
             max_books: Maximum number of books to load (None = all). Useful for testing.
+            stride: Stride for chunking (default: seq_len, i.e., non-overlapping).
+                    Use smaller values (e.g., seq_len // 2) for more training data.
         """
         self.seq_len = seq_len
+        self.stride = stride if stride is not None else seq_len
 
         # Load tokenizer
         if tokenizer is None:
@@ -237,13 +241,14 @@ class PG19Dataset(Dataset):
         print(f"Total tokens: {len(all_tokens):,}")
 
         # Chunk into sequences of seq_len + 1 (for input/target shift)
+        # Use stride for overlapping chunks (more training data)
         self.chunks = []
         chunk_size = seq_len + 1
-        for i in range(0, len(all_tokens) - chunk_size + 1, chunk_size):
+        for i in range(0, len(all_tokens) - chunk_size + 1, self.stride):
             chunk = all_tokens[i : i + chunk_size]
             self.chunks.append(torch.tensor(chunk, dtype=torch.long))
 
-        print(f"Created {len(self.chunks):,} sequences of length {seq_len}")
+        print(f"Created {len(self.chunks):,} sequences of length {seq_len} (stride={self.stride})")
 
     def __len__(self) -> int:
         return len(self.chunks)
@@ -262,6 +267,7 @@ def create_pg19_dataloader(
     num_workers: int = 4,
     tokenizer: GPT2TokenizerFast | None = None,
     max_books: int | None = None,
+    stride: int | None = None,
 ) -> DataLoader:
     """Create a DataLoader for PG-19.
 
@@ -272,6 +278,8 @@ def create_pg19_dataloader(
         num_workers: Number of data loading workers
         tokenizer: GPT-2 tokenizer (will load default if None)
         max_books: Maximum number of books to load (None = all)
+        stride: Stride for chunking (default: seq_len). Use smaller values
+                (e.g., seq_len // 4) for more overlapping training data.
 
     Returns:
         DataLoader for PG-19 dataset
@@ -281,6 +289,7 @@ def create_pg19_dataloader(
         seq_len=seq_len,
         tokenizer=tokenizer,
         max_books=max_books,
+        stride=stride,
     )
     return DataLoader(
         dataset,

@@ -1226,6 +1226,7 @@ def train_sit(
     model_name: str,
     dataset: str = "tinystories",
     max_books: int | None = None,
+    stride: int | None = None,
 ) -> SpectralInjectionTransformer:
     """
     Train a Spectral Injection Transformer.
@@ -1241,6 +1242,7 @@ def train_sit(
         model_name: Name for logging/checkpointing
         dataset: Dataset to use ("tinystories" or "pg19")
         max_books: Maximum number of books for PG-19 (None = all)
+        stride: Stride for PG-19 chunking (None = seq_len, non-overlapping)
 
     Returns:
         Trained model
@@ -1265,6 +1267,7 @@ def train_sit(
             batch_size=train_config.batch_size,
             num_workers=4,
             max_books=max_books,
+            stride=stride,
         )
         val_loader = create_pg19_dataloader(
             split="validation",
@@ -1272,6 +1275,7 @@ def train_sit(
             batch_size=train_config.batch_size,
             num_workers=4,
             max_books=max_books // 10 if max_books else None,  # Fewer books for validation
+            stride=sit_config.seq_len,  # Non-overlapping for validation (faster)
         )
     else:  # tinystories
         train_loader = create_dataloader(
@@ -1828,6 +1832,13 @@ def main():
         default=None,
         help="Maximum number of books to load for PG-19 (default: all). Useful for quick testing.",
     )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=None,
+        help="Stride for PG-19 chunking (default: seq_len, non-overlapping). "
+        "Use smaller values like seq_len//4 for 4x more training data with overlapping chunks.",
+    )
 
     args = parser.parse_args()
 
@@ -2042,6 +2053,7 @@ def main():
             model_name=sit_run_name,
             dataset=args.dataset,
             max_books=args.max_books,
+            stride=args.stride,
         )
 
         # Optionally train baseline for comparison
