@@ -2140,6 +2140,11 @@ def main():
         action="store_true",
         help="Ablation: shuffle AdaLN gamma/beta across batch to test if FNO signal is useful",
     )
+    parser.add_argument(
+        "--usat_disable_spectral",
+        action="store_true",
+        help="Disable spectral conditioning (vanilla universal transformer baseline)",
+    )
 
     # Dataset selection
     parser.add_argument(
@@ -2425,6 +2430,7 @@ def main():
             use_gradient_checkpointing=not args.usat_no_checkpointing,
             grad_warnings=args.usat_grad_warnings,
             ablate_adaln_shuffle=args.usat_ablate_shuffle,
+            disable_spectral=args.usat_disable_spectral,
         )
 
         print(f"USAT config: {usat_config.experiment_summary()}")

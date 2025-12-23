@@ -401,12 +401,17 @@ class USATConfig:
     use_gradient_checkpointing: bool = True
 
     # ===========================================================================
-    # Debugging
+    # Debugging / Ablation
     # ===========================================================================
     grad_warnings: bool = False
 
     # Ablation: shuffle AdaLN conditioning to test if FNO signal is useful
     ablate_adaln_shuffle: bool = False
+
+    # Ablation: disable spectral conditioning entirely (vanilla universal transformer)
+    # When True, gamma=1 and beta=0 for all iterations (standard LayerNorm behavior)
+    # This provides a fair baseline comparison: same architecture, no spectral signal
+    disable_spectral: bool = False
 
     def __post_init__(self):
         # Set defaults based on transformer config

@@ -2718,15 +2718,24 @@ class UniversalSpectralAugmentedTransformer(nn.Module):
         spectral_normalized = normalize_complex(spectral)
 
         # Get per-iteration AdaLN conditioning
-        adaln_conditioning = self.adaln_bridge(spectral_normalized)
-
-        # Ablation: shuffle conditioning
-        if self.config.ablate_adaln_shuffle and self.training:
-            perm = torch.randperm(batch, device=device)
+        if self.config.disable_spectral:
+            # Vanilla universal transformer: gamma=1, beta=0 for all iterations
+            # This is equivalent to standard LayerNorm (no spectral modulation)
+            ones = torch.ones(batch, seq_len, self.config.d_model, device=device)
+            zeros = torch.zeros(batch, seq_len, self.config.d_model, device=device)
             adaln_conditioning = [
-                (g_a[perm], b_a[perm], g_m[perm], b_m[perm])
-                for g_a, b_a, g_m, b_m in adaln_conditioning
+                (ones, zeros, ones.clone(), zeros.clone()) for _ in range(self.config.n_iterations)
             ]
+        else:
+            adaln_conditioning = self.adaln_bridge(spectral_normalized)
+
+            # Ablation: shuffle conditioning
+            if self.config.ablate_adaln_shuffle and self.training:
+                perm = torch.randperm(batch, device=device)
+                adaln_conditioning = [
+                    (g_a[perm], b_a[perm], g_m[perm], b_m[perm])
+                    for g_a, b_a, g_m, b_m in adaln_conditioning
+                ]
 
         # =====================================================================
         # Universal Transformer Iterations
