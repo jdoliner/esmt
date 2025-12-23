@@ -324,6 +324,121 @@ class SATConfig:
 
 
 @dataclass
+class USATConfig:
+    """Configuration for the Universal Spectral-Augmented Transformer (USAT).
+
+    This model combines the Universal Transformer architecture (weight sharing across
+    iterations) with spectral conditioning via FNO and AdaLN. The key insight is that
+    in a Universal Transformer, the only thing differentiating iterations is the
+    conditioning signal - making the FNO's spectral signal crucial for specialization.
+
+    Architecture:
+        Input tokens -> Embedding -> Cumulative FFT -> FNO blocks (once)
+                                                         |
+                                        Spectral State (B, T, D_spec, K, 2)
+                                                         |
+                                    AdaLN Bridge -> [(γ₀, β₀), ..., (γ_{L-1}, β_{L-1})]
+                                                         |
+        h = tok_emb + pos_emb
+        For iteration i in [0, n_iterations):
+            h = SharedTransformerBlock(h, γᵢ, βᵢ)  # Same weights, different conditioning
+                                                         |
+                                        Final LayerNorm -> Logits
+
+    Hypothesis: The spectral information naturally separates by frequency, with higher
+    frequencies capturing local patterns (useful for early iterations) and lower
+    frequencies capturing global patterns (useful for later iterations). The model
+    learns to route appropriate frequency information to each iteration via the
+    per-iteration AdaLN projections.
+    """
+
+    # ===========================================================================
+    # Transformer Configuration
+    # ===========================================================================
+    d_model: int = 64  # Transformer hidden dimension
+    n_iterations: int = 6  # Number of times to apply the shared block
+    n_heads: int = 8  # Number of attention heads
+    vocab_size: int = 50257  # GPT-2 tokenizer vocabulary size
+    seq_len: int = 512  # Maximum sequence length (should be power of 2 for FFT)
+    mlp_ratio: int = 4  # MLP expansion ratio
+    dropout: float = 0.0  # Dropout rate
+    eps: float = 1e-6  # LayerNorm epsilon
+
+    # ===========================================================================
+    # Spectral Stream (FNO World Model) Configuration
+    # ===========================================================================
+    d_spectral: int | None = None  # Spectral dimension (default: d_model // 4)
+    n_fno_layers: int | None = None  # Number of FNO layers (default: n_iterations)
+    k_max: int | None = None  # Number of frequency modes (default: seq_len // 8)
+
+    # FNO activation function
+    fno_activation: Literal["modrelu", "modsoftplus", "modelu"] = "modsoftplus"
+
+    # Output gating for FNO blocks
+    fno_output_gate: bool = True
+    fno_gate_init: float = 2.0
+
+    # Cumulative FFT normalization
+    fft_normalization: Literal["ortho", "position"] = "position"
+
+    # Spectral magnitude clipping
+    spectral_clip_magnitude: float | None = 5.0
+
+    # Spectral layer normalization after FNO blocks
+    spectral_layernorm: Literal["rms", "magnitude"] | None = "rms"
+
+    # ===========================================================================
+    # AdaLN Configuration
+    # ===========================================================================
+    # Constrain gamma to stay close to 1
+    adaln_gamma_scale: float = 2.0
+
+    # ===========================================================================
+    # Gradient Checkpointing
+    # ===========================================================================
+    # Enable gradient checkpointing to save memory (trades compute for memory)
+    # Especially useful for Universal Transformers since same weights are used repeatedly
+    use_gradient_checkpointing: bool = True
+
+    # ===========================================================================
+    # Debugging
+    # ===========================================================================
+    grad_warnings: bool = False
+
+    # Ablation: shuffle AdaLN conditioning to test if FNO signal is useful
+    ablate_adaln_shuffle: bool = False
+
+    def __post_init__(self):
+        # Set defaults based on transformer config
+        if self.d_spectral is None:
+            self.d_spectral = self.d_model // 4
+        if self.n_fno_layers is None:
+            self.n_fno_layers = self.n_iterations
+        if self.k_max is None:
+            self.k_max = self.seq_len // 8
+
+        # Validations
+        assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
+        assert self.d_spectral > 0, "d_spectral must be positive"
+        assert self.n_fno_layers > 0, "n_fno_layers must be positive"
+        assert self.k_max > 0, "k_max must be positive"
+        assert self.n_iterations > 0, "n_iterations must be positive"
+        assert self.seq_len & (self.seq_len - 1) == 0, "seq_len should be power of 2"
+
+    @property
+    def head_dim(self) -> int:
+        return self.d_model // self.n_heads
+
+    def experiment_summary(self) -> str:
+        """Return a summary of configuration."""
+        return (
+            f"USAT(d={self.d_model}, d_spec={self.d_spectral}, "
+            f"iters={self.n_iterations}, fno={self.n_fno_layers}, "
+            f"k_max={self.k_max}, ckpt={self.use_gradient_checkpointing})"
+        )
+
+
+@dataclass
 class SITConfig:
     """Configuration for the Spectral Injection Transformer (SIT).
 

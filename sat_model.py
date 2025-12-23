@@ -25,7 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-from config import SATConfig, SITConfig
+from config import SATConfig, SITConfig, USATConfig
 
 
 # ==============================================================================
@@ -2290,3 +2290,480 @@ class SpectralInjectionTransformer(nn.Module):
 
         # Apply gate and add to hidden states
         return h + gate * spectral_contrib
+
+
+# ==============================================================================
+# Universal Spectral-Augmented Transformer (USAT)
+# ==============================================================================
+
+
+class UniversalSATBlock(nn.Module):
+    """
+    Universal Transformer block with AdaLN conditioning.
+
+    This is a single transformer block that gets applied repeatedly with different
+    AdaLN conditioning at each iteration. The block itself has fixed weights, but
+    the gamma/beta from AdaLN vary per iteration, allowing specialization.
+
+    Architecture:
+        x -> AdaLN(attn_gamma, attn_beta) -> Self-Attention -> + -> AdaLN(mlp_gamma, mlp_beta) -> MLP -> + -> out
+             |                                                 ^    |                                    ^
+             +---------------------- residual -----------------+    +-------------- residual ------------+
+    """
+
+    def __init__(self, config: USATConfig):
+        super().__init__()
+        self.config = config
+        self.n_heads = config.n_heads
+        self.head_dim = config.head_dim
+        self.d_model = config.d_model
+
+        # Pre-norm with AdaLN for attention
+        self.adaln_attn = AdaptiveLayerNorm(
+            config.d_model, eps=config.eps, gamma_scale=config.adaln_gamma_scale
+        )
+
+        # Self-attention
+        self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
+        self.proj = nn.Linear(config.d_model, config.d_model, bias=False)
+
+        # Pre-norm with AdaLN for MLP
+        self.adaln_mlp = AdaptiveLayerNorm(
+            config.d_model, eps=config.eps, gamma_scale=config.adaln_gamma_scale
+        )
+
+        # MLP
+        hidden_dim = config.d_model * config.mlp_ratio
+        self.fc1 = nn.Linear(config.d_model, hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, config.d_model)
+
+        # Causal mask
+        self.register_buffer(
+            "mask",
+            torch.tril(torch.ones(config.seq_len, config.seq_len)).view(
+                1, 1, config.seq_len, config.seq_len
+            ),
+        )
+        self.mask: torch.Tensor
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        gamma_attn: torch.Tensor,
+        beta_attn: torch.Tensor,
+        gamma_mlp: torch.Tensor,
+        beta_mlp: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Forward pass with AdaLN conditioning.
+
+        Args:
+            x: Input tensor (batch, seq_len, d_model)
+            gamma_attn, beta_attn: AdaLN conditioning for attention
+            gamma_mlp, beta_mlp: AdaLN conditioning for MLP
+
+        Returns:
+            Output tensor (batch, seq_len, d_model)
+        """
+        batch, seq_len, d_model = x.shape
+
+        # =====================================================================
+        # Self-Attention with AdaLN
+        # =====================================================================
+
+        # AdaLN pre-norm
+        x_norm = self.adaln_attn(x, gamma_attn, beta_attn)
+
+        # Compute Q, K, V
+        qkv = self.qkv(x_norm)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        # Reshape to heads
+        q = q.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # Attention with causal mask
+        scale = 1.0 / math.sqrt(self.head_dim)
+        attn = (q @ k.transpose(-2, -1)) * scale
+        attn = attn.masked_fill(self.mask[:, :, :seq_len, :seq_len] == 0, float("-inf"))
+        attn = F.softmax(attn, dim=-1)
+
+        # Attend to values
+        attn_out = attn @ v
+        attn_out = attn_out.transpose(1, 2).contiguous().view(batch, seq_len, d_model)
+        attn_out = self.proj(attn_out)
+
+        # Residual connection
+        x = x + attn_out
+
+        # =====================================================================
+        # MLP with AdaLN
+        # =====================================================================
+
+        # AdaLN pre-norm
+        x_norm = self.adaln_mlp(x, gamma_mlp, beta_mlp)
+
+        # MLP
+        mlp_out = self.fc1(x_norm)
+        mlp_out = self.act(mlp_out)
+        mlp_out = self.fc2(mlp_out)
+
+        # Residual connection
+        x = x + mlp_out
+
+        return x
+
+
+class USATAdaLNBridge(nn.Module):
+    """
+    Bridge that converts spectral state to AdaLN parameters for Universal SAT.
+
+    Same architecture as AdaLNBridge but uses n_iterations instead of n_layers.
+    Each iteration gets its own (gamma, beta) pair derived from the spectral state.
+    """
+
+    def __init__(self, d_spectral: int, d_model: int, n_iterations: int, k_max: int):
+        super().__init__()
+        self.d_spectral = d_spectral
+        self.d_model = d_model
+        self.n_iterations = n_iterations
+        self.k_max = k_max
+
+        # Input dimension: flatten full complex spectral tensor
+        input_dim = d_spectral * k_max * 2
+
+        # Two-layer MLP to project from flattened spectral to model dimension
+        hidden_dim = max(d_model * 4, input_dim // 4)
+
+        # LayerNorm on input
+        self.ln_in = nn.LayerNorm(input_dim)
+
+        self.proj1 = nn.Linear(input_dim, hidden_dim)
+        self.act1 = nn.SiLU()
+        self.proj2 = nn.Linear(hidden_dim, d_model)
+        self.act2 = nn.SiLU()
+
+        # LayerNorm before gamma/beta projection
+        self.ln = nn.LayerNorm(d_model)
+
+        # Per-iteration projections to (gamma, beta)
+        # Each iteration gets separate gamma/beta for attention and MLP
+        # Output: 4 * d_model per iteration (gamma_attn, beta_attn, gamma_mlp, beta_mlp)
+        self.iteration_projs = nn.ModuleList(
+            [nn.Linear(d_model, 4 * d_model) for _ in range(n_iterations)]
+        )
+
+        # Scale factor for beta
+        self.beta_scale = 1.0
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        # Standard init for shared projections
+        nn.init.normal_(self.proj1.weight, std=0.02)
+        nn.init.zeros_(self.proj1.bias)
+        nn.init.normal_(self.proj2.weight, std=0.02)
+        nn.init.zeros_(self.proj2.bias)
+
+        # Zero-init for iteration projections so gamma=1, beta=0 at start
+        for proj in self.iteration_projs:
+            assert isinstance(proj, nn.Linear)
+            nn.init.zeros_(proj.weight)
+            assert proj.bias is not None
+            # Output is [gamma_attn, beta_attn, gamma_mlp, beta_mlp]
+            proj.bias.data[: self.d_model] = 1.0  # gamma_attn
+            proj.bias.data[self.d_model : 2 * self.d_model] = 0.0  # beta_attn
+            proj.bias.data[2 * self.d_model : 3 * self.d_model] = 1.0  # gamma_mlp
+            proj.bias.data[3 * self.d_model :] = 0.0  # beta_mlp
+
+    def forward(
+        self, spectral: torch.Tensor
+    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        Args:
+            spectral: Complex tensor (batch, seq_len, d_spectral, k_max, 2)
+
+        Returns:
+            List of (gamma_attn, beta_attn, gamma_mlp, beta_mlp) tuples for each iteration,
+            each tensor has shape (batch, seq_len, d_model)
+        """
+        batch, seq_len, d_spectral, k_max, _ = spectral.shape
+
+        # Flatten the full complex tensor
+        flat = spectral.view(batch, seq_len, -1).float()
+
+        # Normalize input
+        flat = self.ln_in(flat)
+
+        # Two-layer MLP
+        hidden = self.proj1(flat)
+        hidden = self.act1(hidden)
+        hidden = self.proj2(hidden)
+        hidden = self.act2(hidden)
+
+        # Normalize
+        hidden = self.ln(hidden)
+
+        # Per-iteration projections
+        conditioning = []
+        for proj in self.iteration_projs:
+            out = proj(hidden)  # (B, T, 4*D)
+            gamma_attn = out[..., : self.d_model]
+            beta_attn = out[..., self.d_model : 2 * self.d_model]
+            gamma_mlp = out[..., 2 * self.d_model : 3 * self.d_model]
+            beta_mlp = out[..., 3 * self.d_model :]
+
+            # Bound betas with tanh
+            beta_attn = self.beta_scale * torch.tanh(beta_attn / self.beta_scale)
+            beta_mlp = self.beta_scale * torch.tanh(beta_mlp / self.beta_scale)
+
+            conditioning.append((gamma_attn, beta_attn, gamma_mlp, beta_mlp))
+
+        return conditioning
+
+
+class UniversalSpectralAugmentedTransformer(nn.Module):
+    """
+    Universal Spectral-Augmented Transformer (USAT).
+
+    Combines the Universal Transformer architecture (weight sharing across iterations)
+    with spectral conditioning via FNO and AdaLN.
+
+    Key differences from standard SAT:
+    - Single transformer block applied n_iterations times (weight sharing)
+    - Per-iteration AdaLN conditioning from spectral FNO
+    - Gradient checkpointing for memory efficiency
+
+    Architecture:
+        Input tokens -> Embedding -> Cumulative FFT -> FNO blocks
+                                                         |
+                                        Spectral State (B, T, D_spec, K, 2)
+                                                         |
+                                    AdaLN Bridge -> per-iteration (γ, β)
+                                                         |
+        h = tok_emb + pos_emb
+        For iteration i in [0, n_iterations):
+            h = SharedBlock(h, γᵢ_attn, βᵢ_attn, γᵢ_mlp, βᵢ_mlp)
+                                                         |
+                                        Final LayerNorm -> Logits
+    """
+
+    def __init__(self, config: USATConfig):
+        super().__init__()
+        self.config = config
+
+        # Ensure config values are set
+        assert config.d_spectral is not None
+        assert config.n_fno_layers is not None
+        assert config.k_max is not None
+
+        # =====================================================================
+        # Embeddings
+        # =====================================================================
+        self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
+        self.pos_emb = nn.Embedding(config.seq_len, config.d_model)
+
+        # =====================================================================
+        # Spectral Stream
+        # =====================================================================
+
+        # Project to spectral dimension
+        self.spectral_proj_in = nn.Linear(config.d_model, config.d_spectral)
+
+        # Cumulative FFT
+        self.cumulative_fft = CumulativeFFT(
+            config.seq_len, config.k_max, normalization=config.fft_normalization
+        )
+
+        # FNO blocks
+        self.fno_blocks = nn.ModuleList(
+            [
+                FNOBlock(
+                    config.d_spectral,
+                    config.k_max,
+                    activation=config.fno_activation,
+                    use_output_gate=config.fno_output_gate,
+                    gate_init=config.fno_gate_init,
+                )
+                for _ in range(config.n_fno_layers)
+            ]
+        )
+
+        # Spectral layer normalization
+        if config.spectral_layernorm is not None:
+            self.spectral_ln = SpectralLayerNorm(
+                config.d_spectral,
+                config.k_max,
+                mode=config.spectral_layernorm,
+                learnable=True,
+            )
+        else:
+            self.spectral_ln = None
+
+        # Store clipping threshold
+        self.spectral_clip_magnitude = config.spectral_clip_magnitude
+
+        # =====================================================================
+        # Bridge
+        # =====================================================================
+
+        self.adaln_bridge = USATAdaLNBridge(
+            config.d_spectral, config.d_model, config.n_iterations, config.k_max
+        )
+
+        # =====================================================================
+        # Universal Transformer Block (single shared block)
+        # =====================================================================
+
+        self.shared_block = UniversalSATBlock(config)
+
+        # Final layer norm
+        self.ln_f = nn.LayerNorm(config.d_model, eps=config.eps)
+
+        # Output projection
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+        # Re-apply custom initialization for bridge
+        self.adaln_bridge._init_weights()
+
+    def _init_weights(self, module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+
+    def _run_iteration(
+        self,
+        h: torch.Tensor,
+        gamma_attn: torch.Tensor,
+        beta_attn: torch.Tensor,
+        gamma_mlp: torch.Tensor,
+        beta_mlp: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Run a single iteration of the shared block.
+
+        This is separated out to enable gradient checkpointing.
+        """
+        return self.shared_block(h, gamma_attn, beta_attn, gamma_mlp, beta_mlp)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_spectral: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass.
+
+        Args:
+            x: Input token indices (batch, seq_len)
+            return_spectral: If True, also return spectral state
+
+        Returns:
+            logits: Output logits (batch, seq_len, vocab_size)
+            spectral (optional): FNO output (batch, seq_len, d_spectral, k_max, 2)
+        """
+        batch, seq_len = x.shape
+        device = x.device
+
+        # =====================================================================
+        # Embedding
+        # =====================================================================
+
+        tok_emb = self.token_emb(x)
+        pos = torch.arange(seq_len, device=device)
+        pos_emb = self.pos_emb(pos)
+
+        h = tok_emb + pos_emb
+
+        # =====================================================================
+        # Spectral Stream
+        # =====================================================================
+
+        # Project to spectral dimension
+        h_spectral = self.spectral_proj_in(h).to(torch.bfloat16)
+
+        # Cumulative FFT
+        spectral = self.cumulative_fft(h_spectral)
+
+        # Optional clipping
+        if self.spectral_clip_magnitude is not None:
+            spectral = spectral_clip(spectral, self.spectral_clip_magnitude)
+
+        # Optional spectral layer norm
+        if self.spectral_ln is not None:
+            spectral = self.spectral_ln(spectral)
+
+        # FNO blocks
+        for fno_block in self.fno_blocks:
+            spectral = fno_block(spectral)
+            if self.spectral_clip_magnitude is not None:
+                spectral = spectral_clip(spectral, self.spectral_clip_magnitude)
+
+        # =====================================================================
+        # Bridge
+        # =====================================================================
+
+        # Normalize spectral before bridge
+        spectral_normalized = normalize_complex(spectral)
+
+        # Get per-iteration AdaLN conditioning
+        adaln_conditioning = self.adaln_bridge(spectral_normalized)
+
+        # Ablation: shuffle conditioning
+        if self.config.ablate_adaln_shuffle and self.training:
+            perm = torch.randperm(batch, device=device)
+            adaln_conditioning = [
+                (g_a[perm], b_a[perm], g_m[perm], b_m[perm])
+                for g_a, b_a, g_m, b_m in adaln_conditioning
+            ]
+
+        # =====================================================================
+        # Universal Transformer Iterations
+        # =====================================================================
+
+        for i in range(self.config.n_iterations):
+            gamma_attn, beta_attn, gamma_mlp, beta_mlp = adaln_conditioning[i]
+
+            # Convert to float32
+            gamma_attn = gamma_attn.float()
+            beta_attn = beta_attn.float()
+            gamma_mlp = gamma_mlp.float()
+            beta_mlp = beta_mlp.float()
+
+            # Apply shared block with gradient checkpointing if enabled
+            if self.config.use_gradient_checkpointing and self.training:
+                h_out = grad_checkpoint(
+                    self._run_iteration,
+                    h,
+                    gamma_attn,
+                    beta_attn,
+                    gamma_mlp,
+                    beta_mlp,
+                    use_reentrant=False,
+                )
+                assert h_out is not None
+                h = h_out
+            else:
+                h = self._run_iteration(h, gamma_attn, beta_attn, gamma_mlp, beta_mlp)
+
+        # =====================================================================
+        # Output
+        # =====================================================================
+
+        h = self.ln_f(h)
+        logits = self.lm_head(h)
+
+        if return_spectral:
+            return logits, spectral
+        return logits

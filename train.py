@@ -15,11 +15,20 @@ import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
-from config import ESMTConfig, NanoGPTConfig, TrainConfig, ComplexESMTConfig, SATConfig, SITConfig
+from config import (
+    ESMTConfig,
+    NanoGPTConfig,
+    TrainConfig,
+    ComplexESMTConfig,
+    SATConfig,
+    SITConfig,
+    USATConfig,
+)
 from model import NanoGPT, SpectralGPT, ComplexSpectralGPT, count_parameters, create_matched_models
 from sat_model import (
     SpectralAugmentedTransformer,
     SpectralInjectionTransformer,
+    UniversalSpectralAugmentedTransformer,
     count_parameters as sat_count_parameters,
 )
 from spectral_init import (
@@ -1515,6 +1524,253 @@ def train_sit(
     return model
 
 
+# ==============================================================================
+# USAT Training
+# ==============================================================================
+
+
+def train_usat(
+    model: UniversalSpectralAugmentedTransformer,
+    train_config: TrainConfig,
+    usat_config: USATConfig,
+    model_name: str,
+) -> UniversalSpectralAugmentedTransformer:
+    """
+    Train a Universal Spectral-Augmented Transformer.
+
+    Args:
+        model: USAT model to train
+        train_config: Training configuration
+        usat_config: USAT model configuration
+        model_name: Name for logging/checkpointing
+
+    Returns:
+        Trained model
+    """
+    device = get_device()
+    print(f"Training {model_name} on {device}")
+    print(f"Parameters: {format_params(sat_count_parameters(model))}")
+    print(f"Config: {usat_config.experiment_summary()}")
+
+    # Move model to device
+    model = model.to(device)
+
+    # Enable torch.compile for speedup
+    # Note: Gradient checkpointing can cause issues with compile, so we skip if enabled
+    if (
+        train_config.compile_model
+        and hasattr(torch, "compile")
+        and not usat_config.use_gradient_checkpointing
+        and not usat_config.ablate_adaln_shuffle
+    ):
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model)
+    elif usat_config.use_gradient_checkpointing:
+        print("Skipping torch.compile (incompatible with gradient checkpointing)")
+    elif usat_config.ablate_adaln_shuffle:
+        print("Skipping torch.compile (incompatible with ablation shuffle)")
+
+    # Create data loaders
+    train_loader = create_dataloader(
+        split="train",
+        seq_len=usat_config.seq_len,
+        batch_size=train_config.batch_size,
+        num_workers=4,
+    )
+    val_loader = create_dataloader(
+        split="validation",
+        seq_len=usat_config.seq_len,
+        batch_size=train_config.batch_size,
+        num_workers=4,
+    )
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=train_config.lr,
+        betas=(train_config.beta1, train_config.beta2),
+        weight_decay=train_config.weight_decay,
+    )
+
+    # Logger
+    logger = TensorBoardLogger(train_config.log_dir, model_name)
+
+    # Calculate total steps
+    total_steps = len(train_loader) * train_config.epochs
+    print(f"Total training steps: {total_steps}")
+
+    # Training loop
+    global_step = 0
+    best_val_loss = float("inf")
+
+    # Stats tracking
+    tokens_per_batch = train_config.batch_size * usat_config.seq_len
+
+    for epoch in range(train_config.epochs):
+        model.train()
+        epoch_loss = 0.0
+        epoch_tokens = 0
+        epoch_start_time = time.time()
+
+        progress_bar = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch + 1}/{train_config.epochs}",
+            leave=True,
+        )
+
+        for batch_idx, (x, y) in enumerate(progress_bar):
+            x, y = x.to(device), y.to(device)
+            batch_start_time = time.time()
+
+            # Update learning rate
+            lr = get_lr(global_step, train_config, total_steps)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
+
+            optimizer.zero_grad()
+
+            with autocast("cuda", dtype=torch.bfloat16):
+                # Forward pass
+                logits = model(x, return_spectral=False)
+
+                # Main loss: next-token prediction
+                loss = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+
+            # Backward pass
+            loss.backward()
+
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
+
+            # Optimizer step
+            optimizer.step()
+
+            # Logging
+            epoch_loss += loss.item()
+
+            # Track tokens processed
+            epoch_tokens += tokens_per_batch
+            batch_time = time.time() - batch_start_time
+
+            # Calculate running averages and ETA
+            elapsed_time = time.time() - epoch_start_time
+            avg_tokens_per_sec = epoch_tokens / elapsed_time if elapsed_time > 0 else 0
+            batches_remaining = len(train_loader) - (batch_idx + 1)
+            eta_seconds = (
+                (batches_remaining * elapsed_time / (batch_idx + 1)) if batch_idx > 0 else 0
+            )
+
+            # Format ETA
+            eta_min, eta_sec = divmod(int(eta_seconds), 60)
+            eta_str = f"{eta_min}m{eta_sec:02d}s" if eta_min > 0 else f"{eta_sec}s"
+
+            # Update progress bar
+            progress_bar.set_postfix(
+                {
+                    "loss": f"{loss.item():.4f}",
+                    "avg_loss": f"{epoch_loss / (batch_idx + 1):.4f}",
+                    "tok/s": f"{avg_tokens_per_sec:.0f}",
+                    "lr": f"{lr:.2e}",
+                    "eta": eta_str,
+                }
+            )
+
+            # Log to TensorBoard
+            if global_step % 10 == 0:
+                logger.log_scalar("train/loss", loss.item(), global_step)
+                logger.log_scalar("train/lr", lr, global_step)
+                logger.log_scalar("train/tokens_per_sec", avg_tokens_per_sec, global_step)
+
+                # Log gradient norms
+                grad_norms = collect_gradient_norms(model)
+                logger.log_gradient_norms(grad_norms, global_step)
+
+            # Evaluation at intervals
+            if (global_step + 1) % train_config.eval_interval == 0:
+                val_loss = evaluate_usat(model, val_loader, device, max_batches=50)
+                logger.log_scalar("val/loss", val_loss, global_step)
+                print(f"\n  Val Loss: {val_loss:.4f}")
+
+                # Save checkpoint if best
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    save_checkpoint(
+                        model,
+                        optimizer,
+                        global_step,
+                        best_val_loss,
+                        train_config.checkpoint_dir,
+                        model_name,
+                    )
+
+                model.train()
+
+            global_step += 1
+
+        # End of epoch logging
+        epoch_time = time.time() - epoch_start_time
+        avg_loss = epoch_loss / len(train_loader)
+        epoch_tokens_per_sec = epoch_tokens / epoch_time if epoch_time > 0 else 0
+
+        print(f"\nEpoch {epoch + 1} Summary:")
+        print(f"  Avg Loss: {avg_loss:.4f}")
+        print(
+            f"  Tokens: {epoch_tokens:,} | Time: {epoch_time:.1f}s | Throughput: {epoch_tokens_per_sec:,.0f} tok/s"
+        )
+
+    # Final evaluation
+    print("\nFinal Evaluation:")
+    val_loss = evaluate_usat(model, val_loader, device, max_batches=100)
+    print(f"  Val Loss: {val_loss:.4f}")
+
+    # Save final checkpoint
+    save_checkpoint(
+        model, optimizer, global_step, val_loss, train_config.checkpoint_dir, f"{model_name}_final"
+    )
+
+    logger.close()
+    return model
+
+
+@torch.no_grad()
+def evaluate_usat(
+    model: nn.Module,
+    val_loader,
+    device: torch.device,
+    max_batches: int = 50,
+) -> float:
+    """
+    Evaluate USAT model on validation set.
+
+    Args:
+        model: USAT model to evaluate
+        val_loader: Validation data loader
+        device: Device to use
+        max_batches: Maximum batches to evaluate
+
+    Returns:
+        Average validation loss
+    """
+    model.eval()
+    total_loss = 0.0
+    n_batches = 0
+
+    for batch_idx, (x, y) in enumerate(val_loader):
+        if batch_idx >= max_batches:
+            break
+
+        x, y = x.to(device), y.to(device)
+
+        with autocast("cuda", dtype=torch.bfloat16):
+            logits = model(x, return_spectral=False)
+            loss = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+
+        total_loss += loss.item()
+        n_batches += 1
+
+    return total_loss / n_batches
+
+
 @torch.no_grad()
 def evaluate_sit(
     model: nn.Module,
@@ -1837,6 +2093,54 @@ def main():
         "Higher values = shorter gradient path. For 6 layers, try 3 or 4.",
     )
 
+    # ===========================================================================
+    # Universal Spectral-Augmented Transformer (USAT) Options
+    # ===========================================================================
+    parser.add_argument(
+        "--usat",
+        action="store_true",
+        help="Train Universal Spectral-Augmented Transformer (USAT) model",
+    )
+    parser.add_argument(
+        "--usat_n_iterations",
+        type=int,
+        default=6,
+        help="Number of iterations for universal transformer (default: 6)",
+    )
+    parser.add_argument(
+        "--usat_d_spectral",
+        type=int,
+        default=None,
+        help="USAT spectral dimension (default: d_model // 4)",
+    )
+    parser.add_argument(
+        "--usat_n_fno_layers",
+        type=int,
+        default=None,
+        help="Number of FNO layers for USAT (default: n_iterations)",
+    )
+    parser.add_argument(
+        "--usat_k_max",
+        type=int,
+        default=None,
+        help="Number of frequency modes for USAT (default: seq_len // 8)",
+    )
+    parser.add_argument(
+        "--usat_no_checkpointing",
+        action="store_true",
+        help="Disable gradient checkpointing (uses more memory but faster)",
+    )
+    parser.add_argument(
+        "--usat_grad_warnings",
+        action="store_true",
+        help="Enable gradient norm warnings for USAT training instability detection",
+    )
+    parser.add_argument(
+        "--usat_ablate_shuffle",
+        action="store_true",
+        help="Ablation: shuffle AdaLN gamma/beta across batch to test if FNO signal is useful",
+    )
+
     # Dataset selection
     parser.add_argument(
         "--dataset",
@@ -2097,6 +2401,71 @@ def main():
                 dataset=args.dataset,
                 max_books=args.max_books,
                 stride=args.stride,
+            )
+
+        print("\nTraining complete!")
+        return
+
+    # ===========================================================================
+    # Universal Spectral-Augmented Transformer (USAT) Training
+    # ===========================================================================
+    if args.usat:
+        print("\n" + "=" * 60)
+        print("Universal Spectral-Augmented Transformer (USAT) Mode")
+        print("=" * 60)
+
+        # Create USAT config
+        usat_config = USATConfig(
+            d_model=args.d_model,
+            n_iterations=args.usat_n_iterations,
+            seq_len=args.seq_len,
+            d_spectral=args.usat_d_spectral,
+            n_fno_layers=args.usat_n_fno_layers,
+            k_max=args.usat_k_max,
+            use_gradient_checkpointing=not args.usat_no_checkpointing,
+            grad_warnings=args.usat_grad_warnings,
+            ablate_adaln_shuffle=args.usat_ablate_shuffle,
+        )
+
+        print(f"USAT config: {usat_config.experiment_summary()}")
+
+        # Create USAT model
+        usat_model = UniversalSpectralAugmentedTransformer(usat_config)
+        print(f"USAT parameters: {format_params(sat_count_parameters(usat_model))}")
+
+        # Also create NanoGPT baseline for comparison
+        nano_config = NanoGPTConfig(
+            d_model=args.d_model,
+            n_layers=args.usat_n_iterations,  # Match iterations for fair comparison
+            seq_len=args.seq_len,
+        )
+        nanogpt_baseline = NanoGPT(nano_config)
+        print(f"NanoGPT baseline parameters: {format_params(count_parameters(nanogpt_baseline))}")
+
+        # Train USAT
+        print("\n" + "=" * 60)
+        print("Training USAT")
+        print("=" * 60)
+        usat_run_name = f"{args.run_name}_usat" if args.run_name else "usat"
+        usat_model = train_usat(
+            usat_model,
+            train_config,
+            usat_config,
+            model_name=usat_run_name,
+        )
+
+        # Optionally train baseline for comparison
+        if args.model in ["nanogpt", "both"]:
+            print("\n" + "=" * 60)
+            print("Training NanoGPT Baseline (for comparison)")
+            print("=" * 60)
+            nanogpt_run_name = f"{args.run_name}_nanogpt" if args.run_name else "nanogpt"
+            nanogpt_baseline = train_model(
+                nanogpt_baseline,
+                train_config,
+                nano_config,
+                model_name=nanogpt_run_name,
+                use_matryoshka=False,
             )
 
         print("\nTraining complete!")
