@@ -2338,15 +2338,6 @@ class UniversalSATBlock(nn.Module):
         self.act = nn.GELU()
         self.fc2 = nn.Linear(hidden_dim, config.d_model)
 
-        # Causal mask
-        self.register_buffer(
-            "mask",
-            torch.tril(torch.ones(config.seq_len, config.seq_len)).view(
-                1, 1, config.seq_len, config.seq_len
-            ),
-        )
-        self.mask: torch.Tensor
-
     def forward(
         self,
         x: torch.Tensor,
@@ -2384,14 +2375,8 @@ class UniversalSATBlock(nn.Module):
         k = k.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Attention with causal mask
-        scale = 1.0 / math.sqrt(self.head_dim)
-        attn = (q @ k.transpose(-2, -1)) * scale
-        attn = attn.masked_fill(self.mask[:, :, :seq_len, :seq_len] == 0, float("-inf"))
-        attn = F.softmax(attn, dim=-1)
-
-        # Attend to values
-        attn_out = attn @ v
+        # Flash Attention with causal mask (much faster than manual attention)
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch, seq_len, d_model)
         attn_out = self.proj(attn_out)
 
