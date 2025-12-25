@@ -2405,63 +2405,88 @@ class USATAdaLNBridge(nn.Module):
     """
     Bridge that converts spectral state to AdaLN parameters for Universal SAT.
 
-    Same architecture as AdaLNBridge but uses n_iterations instead of n_layers.
-    Each iteration gets its own (gamma, beta) pair derived from the spectral state.
+    This is a parameter-efficient version that uses:
+    1. Mean pooling over frequency bins instead of flattening (saves ~4.3M params)
+    2. Shared iteration projection with iteration embeddings (saves ~1M params)
+
+    Total savings: ~98% reduction in bridge parameters compared to the naive approach.
+
+    Each iteration gets its own (gamma_attn, beta_attn, gamma_mlp, beta_mlp) derived
+    from the spectral state, but the projection weights are shared across iterations.
+    Per-iteration specialization comes from learned iteration embeddings.
     """
 
-    def __init__(self, d_spectral: int, d_model: int, n_iterations: int, k_max: int):
+    def __init__(
+        self,
+        d_spectral: int,
+        d_model: int,
+        n_iterations: int,
+        k_max: int,
+        d_iteration: int = 32,
+    ):
         super().__init__()
         self.d_spectral = d_spectral
         self.d_model = d_model
         self.n_iterations = n_iterations
         self.k_max = k_max
+        self.d_iteration = d_iteration
 
-        # Input dimension: flatten full complex spectral tensor
-        input_dim = d_spectral * k_max * 2
+        # =====================================================================
+        # Option 3c: Mean pooling over frequencies + small MLP
+        # =====================================================================
+        # Instead of flattening (d_spectral * k_max * 2 = 4096 dims),
+        # we mean-pool over k_max frequencies to get (d_spectral * 2 = 64 dims)
 
-        # Two-layer MLP to project from flattened spectral to model dimension
-        hidden_dim = max(d_model * 4, input_dim // 4)
+        pooled_input_dim = d_spectral * 2  # real and imag parts after mean pooling
 
-        # LayerNorm on input
-        self.ln_in = nn.LayerNorm(input_dim)
+        # LayerNorm on pooled input
+        self.ln_in = nn.LayerNorm(pooled_input_dim)
 
-        self.proj1 = nn.Linear(input_dim, hidden_dim)
+        # Two-layer MLP: pooled -> d_model -> d_model
+        self.proj1 = nn.Linear(pooled_input_dim, d_model)
         self.act1 = nn.SiLU()
-        self.proj2 = nn.Linear(hidden_dim, d_model)
+        self.proj2 = nn.Linear(d_model, d_model)
         self.act2 = nn.SiLU()
 
         # LayerNorm before gamma/beta projection
         self.ln = nn.LayerNorm(d_model)
 
-        # Per-iteration projections to (gamma, beta)
-        # Each iteration gets separate gamma/beta for attention and MLP
-        # Output: 4 * d_model per iteration (gamma_attn, beta_attn, gamma_mlp, beta_mlp)
-        self.iteration_projs = nn.ModuleList(
-            [nn.Linear(d_model, 4 * d_model) for _ in range(n_iterations)]
-        )
+        # =====================================================================
+        # Option 2: Shared iteration projection with iteration embeddings
+        # =====================================================================
+        # Instead of n_iterations separate Linear(d_model, 4*d_model) projections,
+        # we use one shared projection that takes (hidden, iteration_embedding) as input.
 
-        # Scale factor for beta
+        # Learned iteration embeddings - allows per-iteration specialization
+        self.iteration_emb = nn.Embedding(n_iterations, d_iteration)
+
+        # Single shared projection: (d_model + d_iteration) -> 4 * d_model
+        # Output: [gamma_attn, beta_attn, gamma_mlp, beta_mlp]
+        self.shared_iter_proj = nn.Linear(d_model + d_iteration, 4 * d_model)
+
+        # Scale factor for beta (bounds output via tanh)
         self.beta_scale = 1.0
 
         self._init_weights()
 
     def _init_weights(self) -> None:
-        # Standard init for shared projections
+        # Standard init for MLP projections
         nn.init.normal_(self.proj1.weight, std=0.02)
         nn.init.zeros_(self.proj1.bias)
         nn.init.normal_(self.proj2.weight, std=0.02)
         nn.init.zeros_(self.proj2.bias)
 
-        # Zero-init for iteration projections so gamma=1, beta=0 at start
-        for proj in self.iteration_projs:
-            assert isinstance(proj, nn.Linear)
-            nn.init.zeros_(proj.weight)
-            assert proj.bias is not None
-            # Output is [gamma_attn, beta_attn, gamma_mlp, beta_mlp]
-            proj.bias.data[: self.d_model] = 1.0  # gamma_attn
-            proj.bias.data[self.d_model : 2 * self.d_model] = 0.0  # beta_attn
-            proj.bias.data[2 * self.d_model : 3 * self.d_model] = 1.0  # gamma_mlp
-            proj.bias.data[3 * self.d_model :] = 0.0  # beta_mlp
+        # Initialize iteration embeddings
+        nn.init.normal_(self.iteration_emb.weight, std=0.02)
+
+        # Zero-init for shared iteration projection so gamma=1, beta=0 at start
+        nn.init.zeros_(self.shared_iter_proj.weight)
+        assert self.shared_iter_proj.bias is not None
+        # Output is [gamma_attn, beta_attn, gamma_mlp, beta_mlp]
+        self.shared_iter_proj.bias.data[: self.d_model] = 1.0  # gamma_attn
+        self.shared_iter_proj.bias.data[self.d_model : 2 * self.d_model] = 0.0  # beta_attn
+        self.shared_iter_proj.bias.data[2 * self.d_model : 3 * self.d_model] = 1.0  # gamma_mlp
+        self.shared_iter_proj.bias.data[3 * self.d_model :] = 0.0  # beta_mlp
 
     def forward(
         self, spectral: torch.Tensor
@@ -2476,25 +2501,43 @@ class USATAdaLNBridge(nn.Module):
         """
         batch, seq_len, d_spectral, k_max, _ = spectral.shape
 
-        # Flatten the full complex tensor
-        flat = spectral.view(batch, seq_len, -1).float()
+        # =====================================================================
+        # Mean pool over frequencies (Option 3c)
+        # =====================================================================
+        # spectral: (B, T, d_spectral, k_max, 2)
+        # Mean over k_max dimension -> (B, T, d_spectral, 2)
+        pooled = spectral.mean(dim=3).float()  # (B, T, d_spectral, 2)
+
+        # Flatten real/imag -> (B, T, d_spectral * 2)
+        pooled = pooled.view(batch, seq_len, -1)
 
         # Normalize input
-        flat = self.ln_in(flat)
+        pooled = self.ln_in(pooled)
 
         # Two-layer MLP
-        hidden = self.proj1(flat)
+        hidden = self.proj1(pooled)
         hidden = self.act1(hidden)
         hidden = self.proj2(hidden)
         hidden = self.act2(hidden)
 
         # Normalize
-        hidden = self.ln(hidden)
+        hidden = self.ln(hidden)  # (B, T, d_model)
 
-        # Per-iteration projections
+        # =====================================================================
+        # Shared iteration projection with iteration embeddings (Option 2)
+        # =====================================================================
         conditioning = []
-        for proj in self.iteration_projs:
-            out = proj(hidden)  # (B, T, 4*D)
+        for i in range(self.n_iterations):
+            # Get iteration embedding and expand to match hidden shape
+            iter_emb = self.iteration_emb.weight[i]  # (d_iteration,)
+            iter_emb = iter_emb.view(1, 1, -1).expand(batch, seq_len, -1)  # (B, T, d_iteration)
+
+            # Concatenate hidden state with iteration embedding
+            combined = torch.cat([hidden, iter_emb], dim=-1)  # (B, T, d_model + d_iteration)
+
+            # Shared projection to get gamma/beta
+            out = self.shared_iter_proj(combined)  # (B, T, 4*d_model)
+
             gamma_attn = out[..., : self.d_model]
             beta_attn = out[..., self.d_model : 2 * self.d_model]
             gamma_mlp = out[..., 2 * self.d_model : 3 * self.d_model]
